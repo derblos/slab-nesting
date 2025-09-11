@@ -11,6 +11,9 @@ import math
 import pandas as pd
 from io import StringIO
 import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+from PIL import Image, ImageDraw
+
 
 # --- NEW: OCR imports ---
 import numpy as np
@@ -420,6 +423,62 @@ def extract_dimensions_from_image(file_bytes: bytes) -> List[float]:
             uniq.append(v)
     return uniq
 
+# ---------- On-screen drawing helpers ----------
+def round_to_step(x: float, step: float) -> float:
+    return round(x / step) * step
+
+def make_grid_image(width_px: int, height_px: int, ppi: float, grid_in: float = 1.0) -> Image.Image:
+    """
+    Create a light gray grid image: lines every `grid_in` inches.
+    ppi = pixels per inch for the preview.
+    """
+    img = Image.new("RGB", (width_px, height_px), "white")
+    d = ImageDraw.Draw(img)
+    step_px = max(1, int(grid_in * ppi))
+    # vertical lines
+    x = 0
+    while x < width_px:
+        d.line([(x, 0), (x, height_px)], fill=(230, 230, 230), width=1)
+        x += step_px
+    # horizontal lines
+    y = 0
+    while y < height_px:
+        d.line([(0, y), (width_px, y)], fill=(230, 230, 230), width=1)
+        y += step_px
+    # border
+    d.rectangle([(0, 0), (width_px-1, height_px-1)], outline=(0,0,0), width=2)
+    return img
+
+def objects_to_parts(json_data, ppi: float, round_step: float = 1/16) -> list[tuple[float,float,int]]:
+    """
+    Convert Fabric.js rect objects to (length, depth, qty).
+    - Converts pixels -> inches using ppi.
+    - Rounds to nearest `round_step` (default 1/16").
+    - Normalizes so length >= depth.
+    - Groups identical sizes and returns [ (L, D, qty), ... ].
+    """
+    if not json_data or "objects" not in json_data:
+        return []
+    dims = []
+    for obj in json_data["objects"]:
+        if obj.get("type") != "rect":
+            continue
+        w = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
+        h = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
+        if w <= 0 or h <= 0:
+            continue
+        w_in = w / ppi
+        h_in = h / ppi
+        w_in = round_to_step(w_in, round_step)
+        h_in = round_to_step(h_in, round_step)
+        L, D = (w_in, h_in) if w_in >= h_in else (h_in, w_in)
+        dims.append((L, D))
+    # group
+    from collections import Counter
+    cnt = Counter(dims)
+    grouped = [(L, D, q) for (L, D), q in sorted(cnt.items(), key=lambda t: (-t[0]*t[1], -t[0], -t[1]))]
+    return grouped
+
 # ───────────────────────── Streamlit UI ─────────────────────────
 
 st.set_page_config(page_title="Slab Nesting MVP", layout="wide")
@@ -442,6 +501,69 @@ st.caption(
     "If the part’s length exceeds usable width in all allowed orientations, it will be split into the **fewest** segments "
     "between [Min seam offset, usable width]. Seam edges show as **dashed red**. Labels show **gross** and **net** sizes."
 )
+
+st.subheader("Draw parts (no typing)")
+
+with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
+    # preview size and scale
+    preview_width_px = st.slider("Preview width (pixels)", 400, 1100, 800, 50, help="Canvas width for drawing.")
+    grid_in = st.selectbox("Grid spacing (inches)", [0.5, 1.0, 2.0], index=1)
+    round_step = st.selectbox("Round measured sizes to", [1/16, 1/8, 1/4, 1/2, 1.0], index=0,
+                              format_func=lambda s: f'1/{int(1/s)}"')
+    # Compute usable area and pixels-per-inch for preview
+    preview_ppi = preview_width_px / max(usable_w, 1e-6)
+    preview_height_px = int(max(usable_h, 1e-6) * preview_ppi)
+
+    # grid background
+    grid_img = make_grid_image(preview_width_px, preview_height_px, preview_ppi, grid_in=grid_in)
+
+    # keep a stable key so "Clear canvas" can reset it
+    if "draw_key" not in st.session_state:
+        st.session_state.draw_key = 0
+
+    c1, c2 = st.columns([3,1])
+    with c1:
+        st.caption("Toolbar: choose rectangle tool, then click-drag to draw parts. Drag to move, resize to adjust. The app measures them automatically.")
+        canvas_result = st_canvas(
+            fill_color="rgba(0, 0, 255, 0.15)",
+            stroke_width=2,
+            stroke_color="#0000FF",
+            background_color="#FFFFFF",
+            background_image=grid_img,
+            height=preview_height_px,
+            width=preview_width_px,
+            drawing_mode="rect",          # rectangles only
+            display_toolbar=True,
+            update_streamlit=True,
+            key=f"canvas-{st.session_state.draw_key}",
+        )
+
+    with c2:
+        if st.button("Clear canvas"):
+            st.session_state.draw_key += 1
+            st.experimental_rerun()
+
+    parts_from_canvas = objects_to_parts(getattr(canvas_result, "json_data", None), preview_ppi, round_step=round_step)
+    if parts_from_canvas:
+        st.success(f"Detected {sum(q for _,_,q in parts_from_canvas)} rectangle(s) in {len(parts_from_canvas)} unique size(s).")
+        st.write("Measured sizes (inches):")
+        import pandas as pd
+        st.dataframe(pd.DataFrame(
+            [{"length": L, "depth": D, "qty": q} for (L, D, q) in parts_from_canvas]
+        ), use_container_width=True)
+        # Append to CSV
+        if st.button("➕ Add these to the CSV input above"):
+            current = st.session_state["csv_text"].strip()
+            if not current.endswith("\n"):
+                current += "\n"
+            # Auto IDs like Draw-1, Draw-2… (grouped by unique size)
+            for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
+                current += f"Draw-{idx},{L},{D},{q}\n"
+            st.session_state["csv_text"] = current
+            st.success("Added to CSV. Scroll up to the CSV box and click **Nest parts**.")
+    else:
+        st.info("Draw a rectangle to get started. Tip: hold Shift while resizing to keep proportions in some browsers.")
+
 
 # keep the CSV box in session state so the Sketch tool can write into it
 example_csv = "id,length,depth,qty\nTop-A,62,25.5,2\nSplash,96,4,4\nIsland,132,38,1\nGiant,260,25,1\n"
