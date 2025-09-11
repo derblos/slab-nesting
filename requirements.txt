@@ -1,2 +1,6 @@
 streamlit
 pandas
+pytesseract
+opencv-python
+Pillow
+numpy
