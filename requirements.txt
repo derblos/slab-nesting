@@ -1,6 +1,4 @@
 streamlit
 pandas
-pytesseract
-opencv-python
+streamlit-drawable-canvas
 Pillow
-numpy
