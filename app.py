@@ -539,8 +539,6 @@ if "csv_text_widget" not in st.session_state:
 st.session_state["csv_text_widget"] = st.text_area(
     "CSV input", value=st.session_state["csv_text_widget"], key="csv_text_widget", height=200
 )
-
-# Always sync widget -> storage after rendering
 st.session_state["csv_text"] = st.session_state["csv_text_widget"]
 
 
@@ -623,29 +621,41 @@ with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
             except Exception:
                 st.experimental_rerun()
 
-    parts_from_canvas = objects_to_parts(getattr(canvas_result, "json_data", None), preview_ppi, round_step=round_step)
-    if parts_from_canvas:
-        st.success(f"Detected {sum(q for _,_,q in parts_from_canvas)} rectangle(s) in {len(parts_from_canvas)} unique size(s).")
-        st.dataframe(
-            pd.DataFrame([{"length": L, "depth": D, "qty": q} for (L, D, q) in parts_from_canvas]),
-            use_container_width=True
-        )
-        if st.button("➕ Add these to the CSV input above"):
-    current = st.session_state["csv_text"].strip()
-    if not current.endswith("\n"):
-        current += "\n"
-    for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
-        current += f"Draw-{idx},{L},{D},{q}\n"
+parts_from_canvas = objects_to_parts(
+    getattr(canvas_result, "json_data", None),
+    preview_ppi,
+    round_step=round_step,
+)
 
-    # Update storage AND the widget mirror, then rerun
-    st.session_state["csv_text"] = current
-    st.session_state["csv_text_widget"] = current
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
-    else:
-        st.info("Draw a rectangle to get started.")
+if parts_from_canvas:
+    st.success(
+        f"Detected {sum(q for _, _, q in parts_from_canvas)} rectangle(s) "
+        f"in {len(parts_from_canvas)} unique size(s)."
+    )
+    st.dataframe(
+        pd.DataFrame([{"length": L, "depth": D, "qty": q}
+                      for (L, D, q) in parts_from_canvas]),
+        use_container_width=True,
+    )
+
+    add_click = st.button("➕ Add these to the CSV input above")
+    if add_click:
+        current = st.session_state["csv_text"].strip()
+        if not current.endswith("\n"):
+            current += "\n"
+        for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
+            current += f"Draw-{idx},{L},{D},{q}\n"
+
+        # update storage and widget mirror, then rerun to refresh the text area
+        st.session_state["csv_text"] = current
+        st.session_state["csv_text_widget"] = current
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
+else:
+    st.info("Draw a rectangle to get started.")
+
 
 # ───────────── Nesting run
 if st.button("Nest parts"):
