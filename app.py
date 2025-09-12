@@ -631,14 +631,19 @@ with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
             use_container_width=True
         )
         if st.button("➕ Add these to the CSV input above"):
-            current = st.session_state["csv_text"].strip()
-            if not current.endswith("\n"):
-                current += "\n"
-            # Auto IDs like Draw-1, Draw-2… grouped by unique size
-            for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
-                current += f"Draw-{idx},{L},{D},{q}\n"
-            st.session_state["csv_text"] = current
-            st.success("Added to CSV. Scroll up to the CSV box and click **Nest parts**.")
+    current = st.session_state["csv_text"].strip()
+    if not current.endswith("\n"):
+        current += "\n"
+    for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
+        current += f"Draw-{idx},{L},{D},{q}\n"
+
+    # Update storage AND the widget mirror, then rerun
+    st.session_state["csv_text"] = current
+    st.session_state["csv_text_widget"] = current
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
     else:
         st.info("Draw a rectangle to get started.")
 
