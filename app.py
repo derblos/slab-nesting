@@ -491,11 +491,18 @@ def objects_to_parts(json_data, ppi: float, round_step: float = 1/16) -> List[Tu
         h_in = round_to_step(h_in, round_step)
         L, D = (w_in, h_in) if w_in >= h_in else (h_in, w_in)
         dims.append((L, D))
-    # group identical sizes
+        # group identical sizes
     from collections import Counter
     cnt = Counter(dims)
-    grouped = [(L, D, q) for (L, D), q in sorted(cnt.items(), key=lambda t: (-t[0]*t[1], -t[0], -t[1]))]
+
+    # sort by area desc, then length desc, then depth desc
+    def sort_key(item):
+        (L, D), q = item
+        return (-(L * D), -L, -D)
+
+    grouped = [ (L, D, q) for ((L, D), q) in sorted(cnt.items(), key=sort_key) ]
     return grouped
+
 
 # ───────────────────────── Streamlit UI ─────────────────────────
 
