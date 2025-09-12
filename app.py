@@ -1,14 +1,14 @@
-# app.py — Slab/Sheet Nesting (Rectangles) + On-screen Drawing (no OCR)
+# app.py — Slab/Sheet Nesting (Rectangles) + On-screen Drawing
 # - Relief border reduces usable area
-# - Kerf as spacing between parts
+# - Kerf/spacing margin between parts
 # - Oversize per side on each part
-# - Depth rule (can't exceed usable depth/height)
+# - Depth rule (height cannot exceed usable depth)
 # - 0°/90° rotations only
-# - Split only when necessary; supports multi-split with min seam offset
+# - Split only when necessary; multi-split with min seam offset
 # - Packs across ALL existing sheets before opening a new one
-# - SVG previews per sheet + single combined SVG download
+# - SVG previews per sheet + combined SVG download
 # - Labels show Part/Seg/Rot + gross WxH and net WxH
-# - NEW: "Draw rectangles on a grid" expander to add parts with zero typing
+# - Draw rectangles on a grid to add parts (no typing)
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
@@ -18,7 +18,11 @@ import pandas as pd
 import streamlit as st
 
 # Drawing widget + simple grid image
-from streamlit_drawable_canvas import st_canvas
+try:
+    from streamlit_drawable_canvas import st_canvas
+    HAVE_CANVAS = True
+except Exception:
+    HAVE_CANVAS = False
 from PIL import Image, ImageDraw
 
 # ───────────────────────── Data models ─────────────────────────
@@ -491,18 +495,14 @@ def objects_to_parts(json_data, ppi: float, round_step: float = 1/16) -> List[Tu
         h_in = round_to_step(h_in, round_step)
         L, D = (w_in, h_in) if w_in >= h_in else (h_in, w_in)
         dims.append((L, D))
-        # group identical sizes
+    # group identical sizes (sort by area desc, then L desc, then D desc)
     from collections import Counter
     cnt = Counter(dims)
-
-    # sort by area desc, then length desc, then depth desc
     def sort_key(item):
         (L, D), q = item
-        return (-(L * D), -L, -D)
-
-    grouped = [ (L, D, q) for ((L, D), q) in sorted(cnt.items(), key=sort_key) ]
+        return (-(L*D), -L, -D)
+    grouped = [(L, D, q) for ((L, D), q) in sorted(cnt.items(), key=sort_key)]
     return grouped
-
 
 # ───────────────────────── Streamlit UI ─────────────────────────
 
@@ -528,21 +528,23 @@ st.caption(
     "Labels show **gross** (cut) and **net** (finished) sizes."
 )
 
-# Keep the CSV text in session state so other panels can append to it
+# Keep CSV text in session so other panels can append to it
 example_csv = "id,length,depth,qty\nTop-A,62,25.5,2\nSplash,96,4,4\nIsland,132,38,1\nGiant,260,25,1\n"
 if "csv_text" not in st.session_state:
     st.session_state["csv_text"] = example_csv
 if "csv_text_widget" not in st.session_state:
     st.session_state["csv_text_widget"] = st.session_state["csv_text"]
 
-# Render the widget using a different key, seeded from our storage
-st.session_state["csv_text_widget"] = st.text_area(
-    "CSV input", value=st.session_state["csv_text_widget"], key="csv_text_widget", height=200
+# Render widget; read its value and sync back to storage
+csv_text_val = st.text_area(
+    "CSV input",
+    value=st.session_state["csv_text_widget"],
+    key="csv_text_widget",
+    height=200,
 )
-st.session_state["csv_text"] = st.session_state["csv_text_widget"]
+st.session_state["csv_text"] = csv_text_val
 
-
-# Parse CSV
+# Parse CSV for display / nesting
 df = None
 try:
     df = pd.read_csv(StringIO(st.session_state["csv_text"]))
@@ -551,12 +553,6 @@ except Exception as e:
 
 if df is not None:
     st.dataframe(df, use_container_width=True)
-
-df = None
-try:
-    df = pd.read_csv(StringIO(st.session_state["csv_text"]))
-except Exception as e:
-    st.error(f"Could not parse CSV: {e}")
 
 # Show computed usable dims + kerf
 col1, col2, col3 = st.columns(3)
@@ -571,91 +567,112 @@ with col3:
 
 # ───────────── On-screen drawing (no typing)
 st.subheader("Draw parts (no typing)")
-with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
-    # Compute usable dims here so the block is self-contained
-    u_w = max(0.0, slab_w - 2*relief)
-    u_h = max(0.0, slab_h - 2*relief)
+if not HAVE_CANVAS:
+    st.info("Install the drawing tool to enable this panel: `pip install streamlit-drawable-canvas`")
+else:
+    with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
+        # Compute usable dims here so the block is self-contained
+        u_w = max(0.0, slab_w - 2*relief)
+        u_h = max(0.0, slab_h - 2*relief)
 
-    # preview size and scale
-    preview_width_px = st.slider("Preview width (pixels)", 400, 1100, 800, 50, help="Canvas width for drawing.")
-    grid_in = st.selectbox("Grid spacing (inches)", [0.5, 1.0, 2.0], index=1)
-    round_step = st.selectbox(
-        "Round measured sizes to",
-        [1/16, 1/8, 1/4, 1/2, 1.0], index=0,
-        format_func=lambda s: f'1/{int(1/s)}"' if s < 1 else '1"'
-    )
-
-    # Pixels-per-inch for the preview
-    preview_ppi = preview_width_px / max(u_w, 1e-6)
-    preview_height_px = int(max(u_h, 1e-6) * preview_ppi)
-
-    # grid background image
-    grid_img = make_grid_image(preview_width_px, preview_height_px, preview_ppi, grid_in=grid_in)
-
-    # stable key so "Clear canvas" resets it
-    if "draw_key" not in st.session_state:
-        st.session_state.draw_key = 0
-
-    c1, c2 = st.columns([3,1])
-    with c1:
-        st.caption("Toolbar: pick rectangle tool, then drag to draw parts. Resize/move to adjust.")
-        canvas_result = st_canvas(
-            fill_color="rgba(0, 0, 255, 0.15)",
-            stroke_width=2,
-            stroke_color="#0000FF",
-            background_color="#FFFFFF",
-            background_image=grid_img,
-            height=preview_height_px,
-            width=preview_width_px,
-            drawing_mode="rect",
-            display_toolbar=True,
-            update_streamlit=True,
-            key=f"canvas-{st.session_state.draw_key}",
+        # preview size and scale
+        preview_width_px = st.slider("Preview width (pixels)", 400, 1100, 800, 50, help="Canvas width for drawing.")
+        grid_in = st.selectbox("Grid spacing (inches)", [0.5, 1.0, 2.0], index=1)
+        round_step = st.selectbox(
+            "Round measured sizes to",
+            [1/16, 1/8, 1/4, 1/2, 1.0], index=0,
+            format_func=lambda s: f'1/{int(1/s)}"' if s < 1 else '1"'
         )
 
-    with c2:
-        if st.button("Clear canvas"):
-            st.session_state.draw_key += 1
+        # Pixels-per-inch for the preview
+        preview_ppi = preview_width_px / max(u_w, 1e-6)
+        preview_height_px = int(max(u_h, 1e-6) * preview_ppi)
+
+        # grid background image
+        grid_img = make_grid_image(preview_width_px, preview_height_px, preview_ppi, grid_in=grid_in)
+
+        # stable key so "Clear canvas" resets it
+        if "draw_key" not in st.session_state:
+            st.session_state.draw_key = 0
+
+        c1, c2 = st.columns([3,1])
+        with c1:
+            st.caption("Toolbar: pick rectangle tool, then drag to draw parts. Resize/move to adjust.")
+            # Some Streamlit versions used by the widget rely on an internal image helper.
+            # If that AttributeError appears, fall back to a plain background.
             try:
-                st.rerun()
-            except Exception:
-                st.experimental_rerun()
+                canvas_result = st_canvas(
+                    fill_color="rgba(0, 0, 255, 0.15)",
+                    stroke_width=2,
+                    stroke_color="#0000FF",
+                    background_color="#FFFFFF",
+                    background_image=grid_img,
+                    height=preview_height_px,
+                    width=preview_width_px,
+                    drawing_mode="rect",
+                    display_toolbar=True,
+                    update_streamlit=True,
+                    key=f"canvas-{st.session_state.draw_key}",
+                )
+            except AttributeError:
+                st.warning("Using a plain background for compatibility with your Streamlit version.")
+                canvas_result = st_canvas(
+                    fill_color="rgba(0, 0, 255, 0.15)",
+                    stroke_width=2,
+                    stroke_color="#0000FF",
+                    background_color="#FFFFFF",
+                    background_image=None,
+                    height=preview_height_px,
+                    width=preview_width_px,
+                    drawing_mode="rect",
+                    display_toolbar=True,
+                    update_streamlit=True,
+                    key=f"canvas-{st.session_state.draw_key}",
+                )
 
-parts_from_canvas = objects_to_parts(
-    getattr(canvas_result, "json_data", None),
-    preview_ppi,
-    round_step=round_step,
-)
+        with c2:
+            if st.button("Clear canvas"):
+                st.session_state.draw_key += 1
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
 
-if parts_from_canvas:
-    st.success(
-        f"Detected {sum(q for _, _, q in parts_from_canvas)} rectangle(s) "
-        f"in {len(parts_from_canvas)} unique size(s)."
-    )
-    st.dataframe(
-        pd.DataFrame([{"length": L, "depth": D, "qty": q}
-                      for (L, D, q) in parts_from_canvas]),
-        use_container_width=True,
-    )
+        parts_from_canvas = objects_to_parts(
+            getattr(canvas_result, "json_data", None),
+            preview_ppi,
+            round_step=round_step,
+        )
 
-    add_click = st.button("➕ Add these to the CSV input above")
-    if add_click:
-        current = st.session_state["csv_text"].strip()
-        if not current.endswith("\n"):
-            current += "\n"
-        for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
-            current += f"Draw-{idx},{L},{D},{q}\n"
+        if parts_from_canvas:
+            st.success(
+                f"Detected {sum(q for _, _, q in parts_from_canvas)} rectangle(s) "
+                f"in {len(parts_from_canvas)} unique size(s)."
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [{"length": L, "depth": D, "qty": q} for (L, D, q) in parts_from_canvas]
+                ),
+                use_container_width=True,
+            )
 
-        # update storage and widget mirror, then rerun to refresh the text area
-        st.session_state["csv_text"] = current
-        st.session_state["csv_text_widget"] = current
-        try:
-            st.rerun()
-        except Exception:
-            st.experimental_rerun()
-else:
-    st.info("Draw a rectangle to get started.")
+            add_click = st.button("➕ Add these to the CSV input above")
+            if add_click:
+                current = st.session_state["csv_text"].strip()
+                if not current.endswith("\n"):
+                    current += "\n"
+                for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
+                    current += f"Draw-{idx},{L},{D},{q}\n"
 
+                # update storage and the widget mirror, then rerun to refresh the text area
+                st.session_state["csv_text"] = current
+                st.session_state["csv_text_widget"] = current
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
+        else:
+            st.info("Draw a rectangle to get started.")
 
 # ───────────── Nesting run
 if st.button("Nest parts"):
