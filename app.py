@@ -532,7 +532,17 @@ st.caption(
 example_csv = "id,length,depth,qty\nTop-A,62,25.5,2\nSplash,96,4,4\nIsland,132,38,1\nGiant,260,25,1\n"
 if "csv_text" not in st.session_state:
     st.session_state["csv_text"] = example_csv
-txt = st.text_area("CSV input", key="csv_text", height=200)
+if "csv_text_widget" not in st.session_state:
+    st.session_state["csv_text_widget"] = st.session_state["csv_text"]
+
+# Render the widget using a different key, seeded from our storage
+st.session_state["csv_text_widget"] = st.text_area(
+    "CSV input", value=st.session_state["csv_text_widget"], key="csv_text_widget", height=200
+)
+
+# Always sync widget -> storage after rendering
+st.session_state["csv_text"] = st.session_state["csv_text_widget"]
+
 
 # Parse CSV
 df = None
@@ -543,6 +553,12 @@ except Exception as e:
 
 if df is not None:
     st.dataframe(df, use_container_width=True)
+
+df = None
+try:
+    df = pd.read_csv(StringIO(st.session_state["csv_text"]))
+except Exception as e:
+    st.error(f"Could not parse CSV: {e}")
 
 # Show computed usable dims + kerf
 col1, col2, col3 = st.columns(3)
