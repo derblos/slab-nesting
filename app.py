@@ -1,569 +1,429 @@
-# app.py — Slab/Sheet Nesting (Rectangles) + On-screen Drawing
-# - Relief border reduces usable area
-# - Kerf/spacing margin between parts
-# - Oversize per side on each part
-# - Depth rule (height cannot exceed usable depth)
-# - 0°/90° rotations only
-# - Split only when necessary; multi-split with min seam offset
-# - Packs across ALL existing sheets before opening a new one
-# - SVG previews per sheet + combined SVG download
-# - Labels show Part/Seg/Rot + gross WxH and net WxH
-# - Draw rectangles on a grid to add parts (no typing)
-# - Robust Streamlit state handling for the CSV text area (no key conflicts)
+# app.py
+# ───────────────────────────────────────────────────────────────────────────
+# Streamlit Nesting Tool (Draw-only workflow)
+# - Draw shapes (rect/polygon)
+# - Live dimensions while drawing
+# - Post-draw edit of dimensions/qty/label/rotation
+# - Zoomable sheet preview with labels & dimensions
+# - "Clear project" button
+# - CSV input hidden by default (set SHOW_CSV=True if you ever need it)
+# ───────────────────────────────────────────────────────────────────────────
 
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
-from io import StringIO
+from __future__ import annotations
+
 import math
+import uuid
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Tuple
+
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from rectpack import newPacker
+from shapely.geometry import Polygon, box as shapely_box
+
 import streamlit as st
+from streamlit_drawable_canvas import st_canvas
 
-# Drawing widget + simple grid image
-try:
-    from streamlit_drawable_canvas import st_canvas
-    HAVE_CANVAS = True
-except Exception:
-    HAVE_CANVAS = False
-from PIL import Image, ImageDraw
+# ───────────────────────── Config ──────────────────────────
+st.set_page_config(page_title="Nesting Tool", layout="wide")
+SHOW_CSV = False  # keep False for draw-only workflow (turn True for troubleshooting)
 
-# ───────────────────────── Data models ─────────────────────────
-
-@dataclass
-class Sheet:
-    id: str
-    w: float  # usable width (X)
-    h: float  # usable height/depth (Y)
-    index: int
-
-@dataclass
-class PartReq:
-    id: str
-    length: float   # long side BEFORE oversize
-    depth: float    # short side BEFORE oversize
-    qty: int
+# ───────────────────────── Helpers ─────────────────────────
 
 @dataclass
 class Part:
     id: str
-    w: float             # gross (cut) width after oversize
-    h: float             # gross (cut) height after oversize
-    net_w: float         # finished width before oversize
-    net_h: float         # finished height before oversize
-    rot_allowed: Tuple[int, ...] = (0, 90)
-    group_id: Optional[str] = None
-    seg_idx: Optional[int] = None
-    seg_total: Optional[int] = None
-    seam_before: bool = False
-    seam_after: bool = False
+    label: str
+    qty: int
+    shape_type: str            # "rect" or "polygon"
+    # Dimensions (in project units). For polygon we store points & arot.
+    width: float | None
+    height: float | None
+    points: List[Tuple[float, float]] | None
+    allow_rotation: bool = True
 
-@dataclass
-class Placed:
-    part_id: str
-    x: float
-    y: float
-    w: float          # gross (cut) width
-    h: float          # gross (cut) height
-    net_w: float      # finished width
-    net_h: float      # finished height
-    rot: int
-    sheet_id: str
-    group_id: Optional[str]
-    seg_idx: Optional[int]
-    seg_total: Optional[int]
-    seam_before: bool
-    seam_after: bool
+    @property
+    def area(self) -> float:
+        if self.shape_type == "rect" and self.width and self.height:
+            return self.width * self.height
+        if self.shape_type == "polygon" and self.points:
+            try:
+                return Polygon(self.points).area
+            except Exception:
+                return 0.0
+        return 0.0
 
-# ───────────────────────── Skyline packer ─────────────────────────
+# Normalize Fabric.js rect object into (w,h)
+def _fabric_rect_dims(obj: Dict) -> Tuple[float, float]:
+    w = float(obj.get("width", 0)) * float(obj.get("scaleX", 1.0))
+    h = float(obj.get("height", 0)) * float(obj.get("scaleY", 1.0))
+    return abs(w), abs(h)
 
-class Skyline:
-    """Bottom-left skyline packer with uniform spacing (kerf) margin."""
-    def __init__(self, sheet: Sheet, spacing: float = 0.0):
-        self.sheet = sheet
-        self.spacing = spacing
-        self.lines = [(0.0, 0.0, sheet.w)]  # (x, y, width)
+# Convert a Fabric.js polygon/path object to a list of points relative to canvas origin
+def _fabric_polygon_points(obj: Dict) -> List[Tuple[float, float]]:
+    # Fabric returns "path" for polygon tool. We’ll approximate by taking the points
+    # from 'path' (M/L commands) or fall back to bounding box.
+    pts: List[Tuple[float, float]] = []
+    path = obj.get("path")
+    if isinstance(path, list):
+        x0 = float(obj.get("left", 0))
+        y0 = float(obj.get("top", 0))
+        sx = float(obj.get("scaleX", 1.0))
+        sy = float(obj.get("scaleY", 1.0))
+        for seg in path:
+            # seg looks like ["L", x, y] or ["M", x, y]
+            if isinstance(seg, list) and len(seg) >= 3 and seg[0] in ("L", "M"):
+                px = x0 + float(seg[1]) * sx
+                py = y0 + float(seg[2]) * sy
+                pts.append((px, py))
+    return pts
 
-    def _fits_here(self, i: int, W: float, H: float) -> Optional[Tuple[float, float]]:
-        x, y, _ = self.lines[i]
-        top = y
-        curr_x = x
-        remain = W
-        j = i
-        while remain > 1e-9:
-            if j >= len(self.lines):
-                return None
-            sx, sy, sw = self.lines[j]
-            if sx > curr_x + 1e-9:
-                return None  # gap between segments
-            can = min(sw - (curr_x - sx), remain)
-            top = max(top, sy)
-            if top + H > self.sheet.h + 1e-9:
-                return None
-            remain -= can
-            curr_x += can
-            j += 1
-        return x, top
+def _bbox_of_polygon(points: List[Tuple[float, float]]) -> Tuple[float, float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (max(xs) - min(xs), max(ys) - min(ys))
 
-    def try_place(self, w: float, h: float) -> Optional[Tuple[float, float]]:
-        # Inflate by spacing margin
-        W = w + 2*self.spacing
-        H = h + 2*self.spacing
-        for i in range(len(self.lines)):
-            pos = self._fits_here(i, W, H)
-            if not pos:
-                continue
-            bx, by = pos
-            new_top = by + H
-            x, y, width = self.lines[i]
-            pre, post = [], []
-            left = x
-            if bx > x + 1e-9:
-                pre.append((x, y, bx - x))
-                left = bx
-            need = W
-            j = i
-            while need > 1e-9 and j < len(self.lines):
-                sx, sy, sw = self.lines[j]
-                seg_left = max(sx, left)
-                seg_can = min(sw - (seg_left - sx), need)
-                right = seg_left + seg_can
-                pre.append((seg_left, new_top, seg_can))
-                left = right
-                need -= seg_can
-                if right < sx + sw - 1e-9:
-                    post.append((right, sy, sx + sw - right))
-                    j += 1
-                    break
-                j += 1
-            post.extend(self.lines[j:])
-            # merge adjacent
-            merged = []
-            for seg in pre + post:
-                if merged and abs(merged[-1][1] - seg[1]) < 1e-9 and abs(merged[-1][0] + merged[-1][2] - seg[0]) < 1e-9:
-                    x0, y0, w0 = merged[-1]
-                    merged[-1] = (x0, y0, w0 + seg[2])
-                else:
-                    merged.append(seg)
-            self.lines = merged
-            return bx + self.spacing, by + self.spacing
-        return None
+def _pretty_units(u: str) -> str:
+    return {"in": "in", "mm": "mm", "cm": "cm"}[u]
 
-# ───────────────────────── Helpers ─────────────────────────
+# ───────────────────────── State ───────────────────────────
 
-def choose_orientation_candidates(L: float, D: float, usable_w: float, usable_h: float, allow_rotate=True):
-    candidates = []
-    if D <= usable_h + 1e-9:
-        candidates.append((L, D, 0))     # 0°: length→w, depth→h
-    if allow_rotate and L <= usable_h + 1e-9:
-        candidates.append((D, L, 90))    # 90°: length→h, depth→w
-    return candidates
+def _init_state():
+    if "parts" not in st.session_state:
+        st.session_state.parts: List[Part] = []
+    if "needs_nest" not in st.session_state:
+        st.session_state.needs_nest = True
+    if "placements" not in st.session_state:
+        st.session_state.placements = []  # list of sheets, each sheet -> list of dicts
+    if "utilization" not in st.session_state:
+        st.session_state.utilization = 0.0
 
-def multi_split_lengths(total_len: float, usable_w: float, min_seg: float) -> List[float]:
-    k_min = math.ceil(total_len / usable_w)
-    k_max = math.floor(total_len / min_seg)
-    if k_min > k_max or k_min <= 0:
-        raise ValueError(f"Infeasible split: {total_len} cannot be divided with min {min_seg} and max {usable_w}.")
-    k = k_min
-    segs = [total_len / k for _ in range(k)]
-    for i in range(k):
-        segs[i] = max(min(segs[i], usable_w), min_seg)
-    diff = total_len - sum(segs)
-    iters = 0
-    while abs(diff) > 1e-6 and iters < 10000:
-        iters += 1; moved = 0.0
-        for j in range(k):
-            if diff > 0:
-                room = usable_w - segs[j]; delta = min(room, diff)
-                if delta > 0: segs[j]+=delta; diff-=delta; moved+=delta
-            else:
-                room = segs[j] - min_seg; delta = min(room, -diff)
-                if delta > 0: segs[j]-=delta; diff+=delta; moved+=delta
-        if moved == 0.0: break
-    if any(s < min_seg - 1e-5 or s > usable_w + 1e-5 for s in segs):
-        raise ValueError("Split adjustment failed.")
-    return segs
+_init_state()
 
-def expand_and_transform_parts(
-    reqs: List[PartReq],
-    usable_w: float,
-    usable_h: float,
-    oversize_per_side: float,
-    min_seam_offset: float,
-    allow_rotate: bool = True,
-) -> List[Part]:
-    out: List[Part] = []
-    for req in reqs:
-        L0, D0 = float(req.length), float(req.depth)
-        if D0 > L0: L0, D0 = D0, L0
-        for _ in range(req.qty):
-            cands = choose_orientation_candidates(L0, D0, usable_w, usable_h, allow_rotate)
-            if not cands:
-                raise ValueError(f"'{req.id}' ({L0}×{D0}) violates depth rule for all orientations (usable depth {usable_h}).")
-            cands.sort(key=lambda t: t[1])  # prefer smaller height
-            chosen = None
-            for w_len, h_dep, rot in cands:
-                if rot == 0 and w_len <= usable_w + 1e-9: chosen=("nosplit",rot,w_len,h_dep); break
-                if rot == 90 and h_dep <= usable_w + 1e-9: chosen=("nosplit",rot,w_len,h_dep); break
-            if chosen and chosen[0]=="nosplit":
-                _, rot, Lw, Dh = chosen
-                net_w = (Lw if rot==0 else Dh); net_h = (Dh if rot==0 else Lw)
-                w = net_w + 2*oversize_per_side; h = net_h + 2*oversize_per_side
-                out.append(Part(req.id, w, h, net_w, net_h, (0,90) if allow_rotate else (0,), None, None, None, False, False))
-                continue
-            w_len, h_dep, rot_for_seams = cands[0]
-            length_to_split = w_len if rot_for_seams==0 else h_dep
-            segs = multi_split_lengths(length_to_split, usable_w, min_seam_offset)
-            k = len(segs)
-            for i_seg, seg_len in enumerate(segs, start=1):
-                if rot_for_seams==0: net_w, net_h = seg_len, h_dep
-                else:                net_w, net_h = w_len, seg_len
-                w = net_w + 2*oversize_per_side; h = net_h + 2*oversize_per_side
-                out.append(Part(f"{req.id}-S{i_seg}", w, h, net_w, net_h, (0,90) if allow_rotate else (0,),
-                                req.id, i_seg, k, i_seg>1, i_seg<k))
-    return out
-
-# ───────────────────────── Packing across sheets ─────────────────────────
-
-def pack_rectangles_across_sheets(usable_w: float, usable_h: float, parts: List[Part], spacing: float):
-    items = sorted(parts, key=lambda p: p.w*p.h, reverse=True)
-    placements: List[Placed] = []; sheets: List[Sheet] = []; skylines: List[Skyline] = []
-
-    def new_sheet():
-        s = Sheet(id=f"Sheet-{len(sheets)+1}", w=usable_w, h=usable_h, index=len(sheets)+1)
-        sheets.append(s); sk = Skyline(s, spacing=spacing); skylines.append(sk); return sk
-    if not skylines: new_sheet()
-
-    for p in items:
-        placed=False
-        orientations = [(0,p.w,p.h),(90,p.h,p.w)] if 90 in p.rot_allowed else [(0,p.w,p.h)]
-        orientations.sort(key=lambda x:x[2])
-        for sk in skylines:
-            for rot,w,h in orientations:
-                if h>usable_h+1e-9: continue
-                pos = sk.try_place(w,h)
-                if pos:
-                    x,y=pos; placements.append(Placed(p.id,x,y,w,h,p.net_w,p.net_h,rot,sk.sheet.id,
-                                                     p.group_id,p.seg_idx,p.seg_total,p.seam_before,p.seam_after))
-                    placed=True; break
-            if placed: break
-        if not placed:
-            sk=new_sheet(); success=False
-            for rot,w,h in orientations:
-                if h>usable_h+1e-9: continue
-                pos=sk.try_place(w,h)
-                if pos:
-                    x,y=pos; placements.append(Placed(p.id,x,y,w,h,p.net_w,p.net_h,rot,sk.sheet.id,
-                                                     p.group_id,p.seg_idx,p.seg_total,p.seam_before,p.seam_after))
-                    success=True; break
-            if not success: raise RuntimeError(f"Failed to place part {p.id} on a fresh sheet.")
-    return placements, sheets
-
-# ───────────────────────── SVG output ─────────────────────────
-
-def _fmt(n: float) -> str:
-    return f"{n:.3f}".rstrip('0').rstrip('.')
-
-def _seam_lines(pl: Placed) -> List[str]:
-    inset = 1.0; dash='stroke="red" stroke-width="0.8" stroke-dasharray="3,2"'; lines=[]
-    if pl.rot==0:
-        if pl.seam_before:
-            x=pl.x+inset; lines.append(f'<line x1="{x}" y1="{pl.y+inset}" x2="{x}" y2="{pl.y+pl.h-inset}" {dash}/>')
-        if pl.seam_after:
-            x=pl.x+pl.w-inset; lines.append(f'<line x1="{x}" y1="{pl.y+inset}" x2="{x}" y2="{pl.y+pl.h-inset}" {dash}/>')
-    else:
-        if pl.seam_before:
-            y=pl.y+inset; lines.append(f'<line x1="{pl.x+inset}" y1="{y}" x2="{pl.x+pl.w-inset}" y2="{y}" {dash}/>')
-        if pl.seam_after:
-            y=pl.y+pl.h-inset; lines.append(f'<line x1="{pl.x+inset}" y1="{y}" x2="{pl.x+pl.w-inset}" y2="{y}" {dash}/>')
-    return lines
-
-def _label_for(pl: Placed) -> List[str]:
-    label=pl.part_id
-    if pl.seg_total and pl.seg_total>1: label+=f" [{pl.seg_idx}/{pl.seg_total}]"
-    return [f'{label} ({pl.rot}°)', f'{_fmt(pl.w)}×{_fmt(pl.h)} (net {_fmt(pl.net_w)}×{_fmt(pl.net_h)})']
-
-def to_svg_pages(placements: List[Placed], sheets: List[Sheet]) -> List[str]:
-    by: Dict[str,List[Placed]] = {}
-    for pl in placements: by.setdefault(pl.sheet_id,[]).append(pl)
-    pages=[]; smap={s.id:s for s in sheets}
-    for sid,items in by.items():
-        s=smap[sid]
-        out=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{s.w}" height="{s.h}" viewBox="0 0 {s.w} {s.h}">']
-        out.append(f'<rect x="0" y="0" width="{s.w}" height="{s.h}" fill="none" stroke="black" stroke-width="0.8"/>')
-        for r in items:
-            out.append(f'<rect x="{r.x}" y="{r.y}" width="{r.w}" height="{r.h}" fill="none" stroke="blue" stroke-width="0.8"/>')
-            l1,l2=_label_for(r)
-            out.append(f'<text x="{r.x+2}" y="{r.y+8}" font-size="6">{l1}</text>')
-            out.append(f'<text x="{r.x+2}" y="{r.y+14}" font-size="6">{l2}</text>')
-            out.extend(_seam_lines(r))
-        out.append("</svg>"); pages.append("\n".join(out))
-    return pages
-
-def to_svg_combined(placements: List[Placed], sheets: List[Sheet], gap: float = 10.0) -> str:
-    by: Dict[str,List[Placed]] = {}
-    for pl in placements: by.setdefault(pl.sheet_id,[]).append(pl)
-    ordered=sorted(sheets,key=lambda s:s.index)
-    max_w=max((s.w for s in ordered), default=0.0)
-    total_h=sum((s.h for s in ordered)) + gap * max(0, len(ordered)-1)
-    out=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{max_w}" height="{total_h}" viewBox="0 0 {max_w} {total_h}">']
-    yoff=0.0
-    for s in ordered:
-        out.append(f'<g transform="translate(0,{yoff})">')
-        out.append(f'<rect x="0" y="0" width="{s.w}" height="{s.h}" fill="none" stroke="black" stroke-width="0.8"/>')
-        for r in by.get(s.id,[]):
-            out.append(f'<rect x="{r.x}" y="{r.y}" width="{r.w}" height="{r.h}" fill="none" stroke="blue" stroke-width="0.8"/>')
-            l1,l2=_label_for(r)
-            out.append(f'<text x="{r.x+2}" y="{r.y+8}" font-size="6">{l1}</text>')
-            out.append(f'<text x="{r.x+2}" y="{r.y+14}" font-size="6">{l2}</text>')
-            out.extend(_seam_lines(r))
-        out.append("</g>"); yoff+=s.h+gap
-    out.append("</svg>"); return "\n".join(out)
-
-def utilization(placements: List[Placed], sheets: List[Sheet]):
-    used = sum(p.w*p.h for p in placements); total = sum(s.w*s.h for s in sheets)
-    return used, total, (used/total*100.0 if total>0 else 0.0)
-
-# ───────────────────────── On-screen drawing helpers ─────────────────────────
-
-def round_to_step(x: float, step: float) -> float: return round(x/step)*step
-
-def make_grid_image(width_px: int, height_px: int, ppi: float, grid_in: float = 1.0) -> Image.Image:
-    img = Image.new("RGB", (width_px, height_px), "white"); d = ImageDraw.Draw(img)
-    step_px = max(1, int(grid_in * ppi))
-    x=0
-    while x<width_px: d.line([(x,0),(x,height_px)], fill=(230,230,230), width=1); x+=step_px
-    y=0
-    while y<height_px: d.line([(0,y),(width_px,y)], fill=(230,230,230), width=1); y+=step_px
-    d.rectangle([(0,0),(width_px-1,height_px-1)], outline=(0,0,0), width=2); return img
-
-def objects_to_parts(json_data, ppi: float, round_step: float = 1/16) -> List[Tuple[float,float,int]]:
-    if not json_data or "objects" not in json_data: return []
-    dims=[]
-    for obj in json_data["objects"]:
-        if obj.get("type")!="rect": continue
-        w=float(obj.get("width",0))*float(obj.get("scaleX",1))
-        h=float(obj.get("height",0))*float(obj.get("scaleY",1))
-        if w<=0 or h<=0: continue
-        w_in=round_to_step(w/ppi, round_step); h_in=round_to_step(h/ppi, round_step)
-        L,D=(w_in,h_in) if w_in>=h_in else (h_in,w_in)
-        dims.append((L,D))
-    from collections import Counter
-    cnt=Counter(dims)
-    def sort_key(item): (L,D),q=item; return (-(L*D), -L, -D)
-    return [(L,D,q) for ((L,D),q) in sorted(cnt.items(), key=sort_key)]
-
-# ───────────────────────── Streamlit UI ─────────────────────────
-
-st.set_page_config(page_title="Slab Nesting MVP", layout="wide")
-st.title("🧩 Slab/Sheet Nesting (Rectangles)")
+# ───────────────────────── Sidebar ─────────────────────────
 
 with st.sidebar:
-    st.header("Global parameters")
-    units = st.selectbox("Units", ["in"], index=0)
-    slab_w = st.number_input('Slab/Sheet width (e.g., 130")', min_value=1.0, value=130.0, step=0.5)
-    slab_h = st.number_input('Slab/Sheet height/depth (e.g., 63")', min_value=1.0, value=63.0, step=0.5)
-    relief = st.number_input('Relief per edge (e.g., 1")', min_value=0.0, value=1.0, step=0.125)
-    kerf = st.number_input('Kerf / min spacing (e.g., 0.125")', min_value=0.0, value=0.125, step=0.125)
-    oversize_per_side = st.number_input('Oversize per side (e.g., 0.0625")', min_value=0.0, value=0.0625, step=0.0625)
-    min_seam_offset = st.number_input('Min seam offset (e.g., 24")', min_value=0.0, value=24.0, step=1.0)
-    allow_rotate = st.checkbox("Allow 90° rotation", value=True)
+    st.header("Project settings")
 
-st.subheader("Enter parts (Length × Depth × Qty)")
-st.caption(
-    "• Length = **long** dimension (pre-oversize). Depth = **short** (pre-oversize). "
-    "If a part’s length exceeds usable width in all allowed orientations, it will be split into the **fewest** segments "
-    "with each segment in [Min seam offset, usable width]. Seam edges show as **dashed red**. "
-    "Labels show **gross** (cut) and **net** (finished) sizes."
-)
+    units = st.selectbox("Units", ["in", "mm", "cm"], index=0)
+    precision = st.number_input("Precision (decimal places)", 0, 4, 2)
 
-# ---- CSV text area: robust state handling (no widget-key assignment during run)
-example_csv = "id,length,depth,qty\nTop-A,62,25.5,2\nSplash,96,4,4\nIsland,132,38,1\nGiant,260,25,1\n"
-if "csv_text" not in st.session_state:
-    st.session_state["csv_text"] = example_csv
-if "csv_text_widget" not in st.session_state:
-    st.session_state["csv_text_widget"] = st.session_state["csv_text"]
+    # px_per_unit controls the scale of the drawing canvas readout (only affects live display)
+    px_per_unit = st.slider("Canvas scale (px per unit)", 2, 20, 8)
 
-# Apply any pending programmatic update to the widget value BEFORE rendering it
-if "csv_text_widget_new_value" in st.session_state:
-    st.session_state["csv_text_widget"] = st.session_state.pop("csv_text_widget_new_value")
+    st.markdown("---")
+    st.subheader("Sheet")
+    sheet_w = st.number_input(f"Sheet width ({_pretty_units(units)})", min_value=1.0, value=97.0, step=1.0, format="%.2f")
+    sheet_h = st.number_input(f"Sheet height ({_pretty_units(units)})", min_value=1.0, value=80.50, step=1.0, format="%.2f")
+    clearance = st.number_input(f"Clearance between parts ({_pretty_units(units)})", min_value=0.0, value=0.25, step=0.05, format="%.2f")
+    allow_rotation_global = st.checkbox("Allow rotation globally", value=True)
 
-csv_text_val = st.text_area(
-    "CSV input",
-    value=st.session_state["csv_text_widget"],
-    key="csv_text_widget",
-    height=200,
-)
-# Sync widget -> storage every run
-st.session_state["csv_text"] = csv_text_val
+    st.markdown("---")
+    if st.button("🗑️ Clear project", use_container_width=True, type="primary"):
+        for k in ["parts", "needs_nest", "placements", "utilization"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        _init_state()
+        st.success("Project cleared.")
 
-# Parse CSV
-df = None
-try:
-    df = pd.read_csv(StringIO(st.session_state["csv_text"]))
-except Exception as e:
-    st.error(f"Could not parse CSV: {e}")
+# ───────────────────────── Main Layout ─────────────────────
 
-if df is not None:
-    st.dataframe(df, use_container_width=True)
+left, right = st.columns([0.55, 0.45])
 
-# Usable dims + kerf
-col1, col2, col3 = st.columns(3)
-with col1:
-    usable_w = max(0.0, slab_w - 2*relief)
-    st.metric("Usable width (X)", f"{usable_w:.3f} {units}")
-with col2:
-    usable_h = max(0.0, slab_h - 2*relief)
-    st.metric("Usable depth (Y)", f"{usable_h:.3f} {units}")
-with col3:
-    st.metric("Kerf / spacing", f"{kerf:.3f} {units}")
+with left:
+    st.title("Nesting Tool — Draw Only")
 
-# ───────────── On-screen drawing (no typing)
-st.subheader("Draw parts (no typing)")
-if not HAVE_CANVAS:
-    st.info("Install the drawing tool to enable this panel: `pip install streamlit-drawable-canvas`")
-else:
-    with st.expander("🧱 Draw rectangles on a grid (auto-measured)"):
-        u_w = max(0.0, slab_w - 2*relief)
-        u_h = max(0.0, slab_h - 2*relief)
+    st.subheader("Draw a part")
+    tool = st.radio("Tool", ["Rectangle", "Polygon"], horizontal=True)
+    drawing_mode = "rect" if tool == "Rectangle" else "polygon"
 
-        preview_width_px = st.slider("Preview width (pixels)", 400, 1100, 800, 50)
-        grid_in = st.selectbox("Grid spacing (inches)", [0.5, 1.0, 2.0], index=1)
-        round_step = st.selectbox(
-            "Round measured sizes to",
-            [1/16, 1/8, 1/4, 1/2, 1.0], index=0,
-            format_func=lambda s: f'1/{int(1/s)}"' if s < 1 else '1"'
+    canvas_w = 900
+    canvas_h = 520
+
+    canvas_result = st_canvas(
+        fill_color="rgba(0, 0, 0, 0.0)",  # no fill
+        stroke_width=2,
+        stroke_color="#1f77b4",
+        background_color="#fafafa",
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode=drawing_mode,
+        display_toolbar=True,
+        key="draw_canvas",
+        update_streamlit=True,
+        realtime_update=True,
+    )
+
+    # Live dimensions during drawing (best-effort with the drawable canvas)
+    live_w = live_h = None
+    last_obj = None
+    if canvas_result and canvas_result.json_data:
+        objs = canvas_result.json_data.get("objects", [])
+        if objs:
+            last_obj = objs[-1]
+            if drawing_mode == "rect" and last_obj.get("type") == "rect":
+                w_px, h_px = _fabric_rect_dims(last_obj)
+                live_w = round(w_px / px_per_unit, precision)
+                live_h = round(h_px / px_per_unit, precision)
+            elif drawing_mode != "rect" and last_obj.get("path"):
+                pts = _fabric_polygon_points(last_obj)
+                if len(pts) >= 3:
+                    bw, bh = _bbox_of_polygon(pts)
+                    live_w = round(bw / px_per_unit, precision)
+                    live_h = round(bh / px_per_unit, precision)
+
+    st.caption(
+        f"**Live dimensions**: "
+        + (f"{live_w} × {live_h} {_pretty_units(units)}" if live_w is not None else "— start/continue drawing —")
+    )
+
+    with st.expander("Add the current shape to the Parts list", expanded=True):
+        default_qty = st.number_input("Quantity", min_value=1, step=1, value=1)
+        default_label = st.text_input("Label (optional)", value="")
+        allow_rot = st.checkbox("Allow rotation for this part", value=True)
+
+        add_btn = st.button("➕ Add this shape", type="secondary")
+
+        if add_btn:
+            if not last_obj:
+                st.warning("Draw a shape first, then click add.")
+            else:
+                if drawing_mode == "rect" and last_obj.get("type") == "rect":
+                    w_px, h_px = _fabric_rect_dims(last_obj)
+                    w = round(w_px / px_per_unit, precision)
+                    h = round(h_px / px_per_unit, precision)
+                    if w <= 0 or h <= 0:
+                        st.error("This rectangle has zero width/height.")
+                    else:
+                        p = Part(
+                            id=str(uuid.uuid4()),
+                            label=default_label or f"Draw-{len(st.session_state.parts)+1}",
+                            qty=int(default_qty),
+                            shape_type="rect",
+                            width=float(w),
+                            height=float(h),
+                            points=None,
+                            allow_rotation=bool(allow_rot),
+                        )
+                        st.session_state.parts.append(p)
+                        st.session_state.needs_nest = True
+                        st.success(f"Added rectangle {p.label} ({w} × {h} {_pretty_units(units)}, qty {p.qty}).")
+                else:
+                    pts = _fabric_polygon_points(last_obj)
+                    if len(pts) < 3:
+                        st.error("Polygon needs at least 3 points.")
+                    else:
+                        # Convert canvas px to project units
+                        pts_units = [(x / px_per_unit, y / px_per_unit) for (x, y) in pts]
+                        w, h = _bbox_of_polygon(pts)
+                        w_u = round(w / px_per_unit, precision)
+                        h_u = round(h / px_per_unit, precision)
+                        p = Part(
+                            id=str(uuid.uuid4()),
+                            label=default_label or f"Draw-{len(st.session_state.parts)+1}",
+                            qty=int(default_qty),
+                            shape_type="polygon",
+                            width=None,
+                            height=None,
+                            points=pts_units,
+                            allow_rotation=bool(allow_rot),
+                        )
+                        st.session_state.parts.append(p)
+                        st.session_state.needs_nest = True
+                        st.success(f"Added polygon {p.label} (~{w_u} × {h_u} {_pretty_units(units)}, qty {p.qty}).")
+
+    st.markdown("---")
+
+    st.subheader("Parts")
+    if not st.session_state.parts:
+        st.info("No parts yet. Draw a shape and click **Add this shape**.")
+    else:
+        # Present editable table for post-draw edits
+        df = pd.DataFrame([{
+            "id": p.id,
+            "Label": p.label,
+            "Type": p.shape_type,
+            "Width": round(p.width, precision) if p.width is not None else None,
+            "Height": round(p.height, precision) if p.height is not None else None,
+            "Qty": p.qty,
+            "Allow Rotation": p.allow_rotation
+        } for p in st.session_state.parts])
+
+        edited = st.data_editor(
+            df.drop(columns=["id"]),
+            use_container_width=True,
+            num_rows="fixed",
+            key="parts_editor",
         )
-        preview_ppi = preview_width_px / max(u_w, 1e-6)
-        preview_height_px = int(max(u_h, 1e-6) * preview_ppi)
 
-        grid_img = make_grid_image(preview_width_px, preview_height_px, preview_ppi, grid_in=grid_in)
+        # Apply edits back into session_state
+        if len(edited) == len(st.session_state.parts):
+            for i, p in enumerate(st.session_state.parts):
+                row = edited.iloc[i]
+                p.label = str(row["Label"])
+                p.allow_rotation = bool(row["Allow Rotation"])
+                p.qty = int(row["Qty"])
 
-        if "draw_key" not in st.session_state:
-            st.session_state.draw_key = 0
+                # Let user edit rectangular dimensions directly; polygons keep points
+                if p.shape_type == "rect":
+                    w = float(row["Width"])
+                    h = float(row["Height"])
+                    if w != p.width or h != p.height:
+                        p.width = max(0.0, w)
+                        p.height = max(0.0, h)
+                        st.session_state.needs_nest = True
 
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.caption("Toolbar: pick rectangle tool, then drag to draw parts. Resize/move to adjust.")
-            try:
-                canvas_result = st_canvas(
-                    fill_color="rgba(0, 0, 255, 0.15)",
-                    stroke_width=2,
-                    stroke_color="#0000FF",
-                    background_color="#FFFFFF",
-                    background_image=grid_img,
-                    height=preview_height_px,
-                    width=preview_width_px,
-                    drawing_mode="rect",
-                    display_toolbar=True,
-                    update_streamlit=True,
-                    key=f"canvas-{st.session_state.draw_key}",
-                )
-            except AttributeError:
-                st.warning("Using a plain background for compatibility with your Streamlit version.")
-                canvas_result = st_canvas(
-                    fill_color="rgba(0, 0, 255, 0.15)",
-                    stroke_width=2,
-                    stroke_color="#0000FF",
-                    background_color="#FFFFFF",
-                    background_image=None,
-                    height=preview_height_px,
-                    width=preview_width_px,
-                    drawing_mode="rect",
-                    display_toolbar=True,
-                    update_streamlit=True,
-                    key=f"canvas-{st.session_state.draw_key}",
-                )
+    if SHOW_CSV:
+        st.markdown("---")
+        st.subheader("CSV import (hidden in draw-only mode)")
+        st.caption("Leave disabled unless you’re troubleshooting legacy CSV input.")
 
-        with c2:
-            if st.button("Clear canvas"):
-                st.session_state.draw_key += 1
-                try:
-                    st.rerun()
-                except Exception:
-                    st.experimental_rerun()
+with right:
+    st.subheader("Nesting")
 
-        parts_from_canvas = objects_to_parts(
-            getattr(canvas_result, "json_data", None),
-            preview_ppi,
-            round_step=round_step,
-        )
+    # Button
+    do_nest = st.button("🧩 Nest parts", type="primary", use_container_width=True)
 
-        if parts_from_canvas:
-            st.success(
-                f"Detected {sum(q for _, _, q in parts_from_canvas)} rectangle(s) "
-                f"in {len(parts_from_canvas)} unique size(s)."
-            )
-            st.dataframe(
-                pd.DataFrame(
-                    [{"length": L, "depth": D, "qty": q} for (L, D, q) in parts_from_canvas]
-                ),
-                use_container_width=True,
-            )
+    # Run nesting (rectangles only; polygons pack by their bounding box)
+    def _rectpack(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool):
+        packer = newPacker(rotation=rotation)
 
-            if st.button("➕ Add these to the CSV input above"):
-                current = st.session_state["csv_text"].strip()
-                if not current.endswith("\n"):
-                    current += "\n"
-                for idx, (L, D, q) in enumerate(parts_from_canvas, start=1):
-                    current += f"Draw-{idx},{L},{D},{q}\n"
+        # Add rects (convert polygons to bounding boxes for now)
+        to_add = []
+        for p in parts:
+            if p.qty <= 0:
+                continue
+            if p.shape_type == "rect" and p.width and p.height:
+                w = p.width + clearance
+                h = p.height + clearance
+            elif p.shape_type == "polygon" and p.points:
+                poly = Polygon(p.points)
+                minx, miny, maxx, maxy = poly.bounds
+                w = (maxx - minx) + clearance
+                h = (maxy - miny) + clearance
+            else:
+                continue
 
-                # Update storage, schedule widget update for next run, then rerun
-                st.session_state["csv_text"] = current
-                st.session_state["csv_text_widget_new_value"] = current
-                try:
-                    st.rerun()
-                except Exception:
-                    st.experimental_rerun()
+            # Add each quantity instance as its own rect, keep a readable rid
+            for q in range(p.qty):
+                rid = f"{p.label}#{q+1}"
+                to_add.append((w, h, rid, p.label))
+
+        if not to_add:
+            return [], 0.0
+
+        for (w, h, rid, _) in to_add:
+            packer.add_rect(w, h, rid=rid)
+
+        # Allow many sheets; rectpack needs us to pre-add bins
+        for _ in range(200):  # practically "unlimited" for typical use
+            packer.add_bin(sheet_w, sheet_h)
+
+        packer.pack()
+
+        # Collect placements by sheet
+        sheets = []
+        total_part_area = 0.0
+        for abin in packer:
+            rects = abin.rect_list()  # (x, y, w, h, rid)
+            if not rects:
+                continue
+            placements = []
+            for (x, y, w, h, rid) in rects:
+                label = rid.split("#")[0]
+                total_part_area += max(0.0, (w - clearance)) * max(0.0, (h - clearance))
+                placements.append({
+                    "x": x, "y": y,
+                    "w": w - clearance,
+                    "h": h - clearance,
+                    "rid": rid,
+                    "label": label
+                })
+            sheets.append({
+                "sheet_w": sheet_w,
+                "sheet_h": sheet_h,
+                "placements": placements
+            })
+
+        # Utilization
+        used_area = total_part_area
+        total_sheet_area = max(1e-9, len(sheets) * sheet_w * sheet_h)
+        util = used_area / total_sheet_area if total_sheet_area else 0.0
+        return sheets, util
+
+    if do_nest:
+        if not st.session_state.parts:
+            st.warning("Add some parts first.")
         else:
-            st.info("Draw a rectangle to get started.")
+            st.session_state.placements, st.session_state.utilization = _rectpack(
+                st.session_state.parts,
+                sheet_w=sheet_w,
+                sheet_h=sheet_h,
+                clearance=clearance,
+                rotation=allow_rotation_global,
+            )
+            st.session_state.needs_nest = False
 
-# ───────────── Nesting run
-if st.button("Nest parts"):
-    try:
-        if df is None or df.empty:
-            st.stop()
-        reqs: List[PartReq] = []
-        for _, r in df.iterrows():
-            pid = str(r["id"]); L = float(r["length"]); D = float(r["depth"]); Q = int(r["qty"])
-            if Q > 0: reqs.append(PartReq(pid, L, D, Q))
+    if st.session_state.placements:
+        util_pct = round(st.session_state.utilization * 100, 2)
+        used_area = 0.0
+        for sheet in st.session_state.placements:
+            for p in sheet["placements"]:
+                used_area += p["w"] * p["h"]
+        total_area = max(1e-9, len(st.session_state.placements) * sheet_w * sheet_h)
 
-        parts = expand_and_transform_parts(
-            reqs,
-            usable_w=usable_w,
-            usable_h=usable_h,
-            oversize_per_side=oversize_per_side,
-            min_seam_offset=min_seam_offset,
-            allow_rotate=allow_rotate,
+        st.markdown(f"**Sheets used:** {len(st.session_state.placements)}")
+        st.markdown(
+            f"**Utilization:** {util_pct}% "
+            f"(used {round(used_area, 2)} / {round(total_area, 2)} {_pretty_units(units)}²)"
         )
+        if st.session_state.needs_nest:
+            st.info("Parts changed. Results are stale — click **Nest parts** again.")
 
-        placements, sheets = pack_rectangles_across_sheets(
-            usable_w=usable_w,
-            usable_h=usable_h,
-            parts=parts,
-            spacing=kerf,
-        )
+        st.markdown("---")
+        st.subheader("Sheet preview (zoom & pan)")
 
-        used_area, total_area, util_pct = utilization(placements, sheets)
-        st.subheader("Results")
-        st.write(f"**Sheets used:** {len(sheets)}")
-        st.write(f"**Utilization:** {util_pct:.2f}% (used {used_area:.2f} / {total_area:.2f} {units}²)")
+        # Render each sheet in its own Plotly figure
+        for si, sheet in enumerate(st.session_state.placements, start=1):
+            W = sheet["sheet_w"]; H = sheet["sheet_h"]
+            fig = go.Figure()
+            # Draw sheet border
+            fig.add_shape(
+                type="rect",
+                x0=0, y0=0, x1=W, y1=H,
+                line=dict(width=2),
+                fillcolor="rgba(240,240,240,0.1)"
+            )
 
-        for svg_page in to_svg_pages(placements, sheets):
-            st.markdown(svg_page, unsafe_allow_html=True)
-            st.divider()
+            # Draw placements
+            for place in sheet["placements"]:
+                x = place["x"]; y = place["y"]; w = place["w"]; h = place["h"]
+                label = place["label"]
+                fig.add_shape(
+                    type="rect",
+                    x0=x, y0=y, x1=x+w, y1=y+h,
+                    line=dict(width=1),
+                    fillcolor="rgba(100,150,250,0.15)"
+                )
+                # Label & dims
+                fig.add_annotation(
+                    x=x + w/2, y=y + h/2,
+                    text=f"{label}<br>{round(w, precision)} × {round(h, precision)}",
+                    showarrow=False,
+                    font=dict(size=12),
+                )
 
-        download_svg = to_svg_combined(placements, sheets)
-        st.download_button("Download SVG", data=download_svg, file_name="nest_layouts.svg", mime="image/svg+xml")
+            fig.update_yaxes(scaleanchor="x", scaleratio=1)  # keep 1:1 scale
+            fig.update_layout(
+                title=f"Sheet {si}",
+                width=900, height=650,
+                margin=dict(l=30, r=30, t=50, b=30),
+                xaxis=dict(range=[-1, W+1], title=f"Width ({_pretty_units(units)})"),
+                yaxis=dict(range=[H+1, -1], title=f"Height ({_pretty_units(units)})"),  # invert for top-left origin feel
+                dragmode="pan",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Placed parts")
-        table = pd.DataFrame([{
-            "sheet": p.sheet_id, "part": p.part_id, "group": p.group_id or "",
-            "seg": f"{p.seg_idx}/{p.seg_total}" if p.seg_total else "",
-            "x": round(p.x, 3), "y": round(p.y, 3),
-            "gross_w": round(p.w, 3), "gross_h": round(p.h, 3),
-            "net_w": round(p.net_w, 3), "net_h": round(p.net_h, 3),
-            "rot": p.rot, "seam_before": p.seam_before, "seam_after": p.seam_after
-        } for p in placements])
-        st.dataframe(table, use_container_width=True)
-
-    except Exception as e:
-        st.error(str(e))
+    else:
+        st.info("No nesting results yet. Click **Nest parts** when you’re ready.")
