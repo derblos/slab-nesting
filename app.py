@@ -1,4 +1,4 @@
-# app.py  — Draw-only nesting with auto-split + parametric L-shape
+# app.py — Draw-only nesting with auto-split fix + parametric L-shape
 from __future__ import annotations
 
 import math, uuid
@@ -95,7 +95,7 @@ left, right = st.columns([0.55, 0.45])
 with left:
     st.title("Nesting Tool — Draw Only")
 
-    # ------- Tool chooser (added L-shape) -------
+    # ------- Tool chooser (includes L-shape) -------
     tool = st.radio("Tool", ["Rectangle", "Polygon (freehand)", "L-shape (parametric)"], horizontal=False)
 
     # ------- Drawing canvas for rect/polygon -------
@@ -136,7 +136,7 @@ with left:
     # ------- Parametric L-shape input -------
     l_poly_units = None
     if tool == "L-shape (parametric)":
-        st.write("Define outer legs (A and B), inside notch, and angle. Defaults create a right-angle L; change angle for a mitered/angled inside corner.")
+        st.write("Define outer legs (A and B), inside thicknesses (tA/tB), and inside angle (defaults 90°).")
         colA, colB = st.columns(2)
         with colA:
             A = st.number_input(f"Outer leg A length ({_pretty_units(units)})", min_value=1.0, value=48.0, step=0.5, format="%.2f")
@@ -146,23 +146,19 @@ with left:
             tB = st.number_input(f"Leg B width/thickness ({_pretty_units(units)})", min_value=1.0, value=26.0, step=0.5, format="%.2f")
         angle = st.number_input("Inside angle (degrees)", min_value=30.0, max_value=150.0, value=90.0, step=1.0, format="%.0f")
 
-        # Build polygon for L: start at origin, go around perimeter (simple 8-point L)
-        # For angle != 90°, rotate the B leg around the inside corner.
         def make_L_polygon(A, tA, B, tB, angle_deg) -> List[Tuple[float, float]]:
-            # Base right-angle L in local coords (origin at inside corner)
-            # Outline order: along A leg, around outside, back along B leg, around inside notch, return.
+            # Simple 7-point L outline (right-angle base), origin at inside corner
             pts = [
                 (0, 0),
                 (A, 0),
                 (A, tA),
                 (tA, tA),
-                (tA, B),  # up B
+                (tA, B),
                 (0, B),
-                (0, 0)    # close
+                (0, 0)
             ]
-            # If angle != 90°, rotate the B leg and the inside corner section
             if abs(angle_deg - 90.0) > 1e-6:
-                theta = math.radians(90.0 - angle_deg)  # positive = open angle > 90 reduces rotation
+                theta = math.radians(90.0 - angle_deg)
                 def rot(p):
                     x, y = p
                     xr = x*math.cos(theta) - y*math.sin(theta)
@@ -172,8 +168,6 @@ with left:
             return pts
 
         l_poly_units = make_L_polygon(A, tA, B, tB, angle)
-
-        # Quick preview
         prev = go.Figure()
         x = [p[0] for p in l_poly_units]; y = [p[1] for p in l_poly_units]
         prev.add_trace(go.Scatter(x=x+[x[0]], y=y+[y[0]], mode="lines+markers", name="L"))
@@ -265,91 +259,91 @@ with left:
 with right:
     st.subheader("Nesting")
 
-    # ------- Auto-split logic for oversized rectangles -------
+    # ------- Auto-split logic for oversized rectangles (fixed for clearance) -------
     def split_rect_if_needed(p: Part, sheet_w: float, sheet_h: float,
-                         min_leg: float, seam_gap: float, prefer_long: bool) -> List[Part]:
-    if p.shape_type != "rect" or p.width is None or p.height is None:
-        return [p]
-    W, H = p.width, p.height
+                             min_leg: float, seam_gap: float, prefer_long: bool) -> List[Part]:
+        if p.shape_type != "rect" or p.width is None or p.height is None:
+            return [p]
+        W, H = p.width, p.height
 
-    # ✅ account for clearance so panels never exceed the bin
-    usable_w = max(0.0, sheet_w - clearance)
-    usable_h = max(0.0, sheet_h - clearance)
+        # account for clearance so panels never exceed the bin after packing adds clearance
+        usable_w = max(0.0, sheet_w - clearance)
+        usable_h = max(0.0, sheet_h - clearance)
 
-    if W <= usable_w and H <= usable_h:
-        return [p]
+        if W <= usable_w and H <= usable_h:
+            return [p]
 
-    long_side = "W" if W >= H else "H"
-    split_along_width = (long_side == "W") if prefer_long else (long_side == "H")
-    if W > usable_w and H <= usable_h:  # force width split if only width is the problem
-        split_along_width = True
-    if H > usable_h and W <= usable_w:  # force height split if only height is the problem
-        split_along_width = False
+        long_side = "W" if W >= H else "H"
+        split_along_width = (long_side == "W") if prefer_long else (long_side == "H")
+        if W > usable_w and H <= usable_h:  # force width split if only width is the problem
+            split_along_width = True
+        if H > usable_h and W <= usable_w:  # force height split if only height is the problem
+            split_along_width = False
 
-    parts_out: List[Part] = []
-    if split_along_width:
-        remaining = W
-        idx = 1
-        while remaining > 1e-9:
-            panel = min(usable_w, remaining)
-            if panel < min_leg - 1e-9:
-                # try to merge with previous short panel
-                if parts_out:
-                    prev = parts_out.pop()
-                    merged = prev.width + seam_gap + panel
-                    if merged > usable_w + 1e-9:
-                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
+        parts_out: List[Part] = []
+
+        if split_along_width:
+            remaining = W
+            idx = 1
+            while remaining > 1e-9:
+                panel = min(usable_w, remaining)
+                if panel < min_leg - 1e-9:
+                    if parts_out:
+                        prev = parts_out.pop()
+                        merged = prev.width + seam_gap + panel
+                        if merged > usable_w + 1e-9:
+                            st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
+                            return [p]
+                        parts_out.append(Part(
+                            id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
+                            qty=p.qty, shape_type="rect", width=merged, height=H, points=None,
+                            allow_rotation=p.allow_rotation
+                        ))
+                    else:
+                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
                         return [p]
+                else:
                     parts_out.append(Part(
-                        id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
-                        qty=p.qty, shape_type="rect", width=merged, height=H, points=None,
+                        id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
+                        qty=p.qty, shape_type="rect", width=panel, height=H, points=None,
                         allow_rotation=p.allow_rotation
                     ))
-                else:
-                    st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                    return [p]
-            else:
-                parts_out.append(Part(
-                    id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
-                    qty=p.qty, shape_type="rect", width=panel, height=H, points=None,
-                    allow_rotation=p.allow_rotation
-                ))
-            remaining -= panel
-            if remaining > 1e-9:
-                remaining -= seam_gap  # account for seam kerf between panels
-            idx += 1
-    else:
-        remaining = H
-        idx = 1
-        while remaining > 1e-9:
-            panel = min(usable_h, remaining)
-            if panel < min_leg - 1e-9:
-                if parts_out:
-                    prev = parts_out.pop()
-                    merged = prev.height + seam_gap + panel
-                    if merged > usable_h + 1e-9:
-                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
+                remaining -= panel
+                if remaining > 1e-9:
+                    remaining -= seam_gap
+                idx += 1
+        else:
+            remaining = H
+            idx = 1
+            while remaining > 1e-9:
+                panel = min(usable_h, remaining)
+                if panel < min_leg - 1e-9:
+                    if parts_out:
+                        prev = parts_out.pop()
+                        merged = prev.height + seam_gap + panel
+                        if merged > usable_h + 1e-9:
+                            st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
+                            return [p]
+                        parts_out.append(Part(
+                            id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
+                            qty=p.qty, shape_type="rect", width=W, height=merged, points=None,
+                            allow_rotation=p.allow_rotation
+                        ))
+                    else:
+                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
                         return [p]
+                else:
                     parts_out.append(Part(
-                        id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
-                        qty=p.qty, shape_type="rect", width=W, height=merged, points=None,
+                        id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
+                        qty=p.qty, shape_type="rect", width=W, height=panel, points=None,
                         allow_rotation=p.allow_rotation
                     ))
-                else:
-                    st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                    return [p]
-            else:
-                parts_out.append(Part(
-                    id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
-                    qty=p.qty, shape_type="rect", width=W, height=panel, points=None,
-                    allow_rotation=p.allow_rotation
-                ))
-            remaining -= panel
-            if remaining > 1e-9:
-                remaining -= seam_gap
-            idx += 1
+                remaining -= panel
+                if remaining > 1e-9:
+                    remaining -= seam_gap
+                idx += 1
 
-    return parts_out if parts_out else [p]
+        return parts_out if parts_out else [p]
 
     # ------- Rectpack wrapper (polygons use bbox for now) -------
     def _rectpack(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool):
@@ -367,18 +361,26 @@ with right:
                 for _ in range(p.qty):
                     expanded.append(s)
 
-        # Add to packer
+        EPS = 1e-6
         for s in expanded:
             if s.shape_type == "rect" and s.width and s.height:
-                w = s.width + clearance; h = s.height + clearance
+                w = s.width + clearance
+                h = s.height + clearance
             elif s.shape_type == "polygon" and s.points:
                 poly = Polygon(s.points); minx, miny, maxx, maxy = poly.bounds
                 w = (maxx - minx) + clearance; h = (maxy - miny) + clearance
                 if w > sheet_w + 1e-9 or h > sheet_h + 1e-9:
-                    st.session_state.messages.append(f"⚠️ {s.label}: polygon (bbox {round(w-clearance,2)}×{round(h-clearance,2)}) exceeds sheet; cannot auto-split polygons.")
+                    st.session_state.messages.append(
+                        f"⚠️ {s.label}: polygon (bbox {round(w-clearance,2)}×{round(h-clearance,2)}) exceeds sheet; cannot auto-split polygons."
+                    )
                     continue
             else:
                 continue
+
+            # clamp panel size just under bin size
+            w = min(w, sheet_w - EPS)
+            h = min(h, sheet_h - EPS)
+
             rid = f"{s.label}#{uuid.uuid4().hex[:4]}"
             to_add.append((w, h, rid, s.label))
 
