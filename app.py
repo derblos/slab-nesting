@@ -1,7 +1,7 @@
-# app.py — Draw-only nesting with auto-split fix + parametric L-shape
+# app.py — Draw-only nesting with split-orientation rule + Konva sheet editor
 from __future__ import annotations
 
-import math, uuid
+import json, math, uuid
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
@@ -12,6 +12,7 @@ from shapely.geometry import Polygon
 
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Nesting Tool", layout="wide")
 SHOW_CSV = False  # keep False for draw-only workflow
@@ -34,6 +35,7 @@ def _init_state():
     st.session_state.setdefault("placements", [])
     st.session_state.setdefault("utilization", 0.0)
     st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("_open_editor", False)
 
 _init_state()
 
@@ -84,7 +86,7 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🗑️ Clear project", use_container_width=True, type="primary"):
-        for k in ["parts", "needs_nest", "placements", "utilization", "messages"]:
+        for k in ["parts", "needs_nest", "placements", "utilization", "messages", "_open_editor"]:
             st.session_state.pop(k, None)
         _init_state()
         st.success("Project cleared.")
@@ -136,7 +138,7 @@ with left:
     # ------- Parametric L-shape input -------
     l_poly_units = None
     if tool == "L-shape (parametric)":
-        st.write("Define outer legs (A and B), inside thicknesses (tA/tB), and inside angle (defaults 90°).")
+        st.write("Define outer legs (A & B), widths (tA/tB), and inside angle (defaults 90°).")
         colA, colB = st.columns(2)
         with colA:
             A = st.number_input(f"Outer leg A length ({_pretty_units(units)})", min_value=1.0, value=48.0, step=0.5, format="%.2f")
@@ -147,7 +149,6 @@ with left:
         angle = st.number_input("Inside angle (degrees)", min_value=30.0, max_value=150.0, value=90.0, step=1.0, format="%.0f")
 
         def make_L_polygon(A, tA, B, tB, angle_deg) -> List[Tuple[float, float]]:
-            # Simple 7-point L outline (right-angle base), origin at inside corner
             pts = [
                 (0, 0),
                 (A, 0),
@@ -259,11 +260,11 @@ with left:
 with right:
     st.subheader("Nesting")
 
-    # ------- Auto-split logic for oversized rectangles (fixed for clearance) -------
+    # ------- Auto-split logic for oversized rectangles (returns flag if split) -------
     def split_rect_if_needed(p: Part, sheet_w: float, sheet_h: float,
-                             min_leg: float, seam_gap: float, prefer_long: bool) -> List[Part]:
+                             min_leg: float, seam_gap: float, prefer_long: bool) -> tuple[list[Part], bool]:
         if p.shape_type != "rect" or p.width is None or p.height is None:
-            return [p]
+            return [p], False
         W, H = p.width, p.height
 
         # account for clearance so panels never exceed the bin after packing adds clearance
@@ -271,20 +272,19 @@ with right:
         usable_h = max(0.0, sheet_h - clearance)
 
         if W <= usable_w and H <= usable_h:
-            return [p]
+            return [p], False
 
         long_side = "W" if W >= H else "H"
         split_along_width = (long_side == "W") if prefer_long else (long_side == "H")
-        if W > usable_w and H <= usable_h:  # force width split if only width is the problem
+        if W > usable_w and H <= usable_h:
             split_along_width = True
-        if H > usable_h and W <= usable_w:  # force height split if only height is the problem
+        if H > usable_h and W <= usable_w:
             split_along_width = False
 
         parts_out: List[Part] = []
 
         if split_along_width:
-            remaining = W
-            idx = 1
+            remaining = W; idx = 1
             while remaining > 1e-9:
                 panel = min(usable_w, remaining)
                 if panel < min_leg - 1e-9:
@@ -293,7 +293,7 @@ with right:
                         merged = prev.width + seam_gap + panel
                         if merged > usable_w + 1e-9:
                             st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
-                            return [p]
+                            return [p], False
                         parts_out.append(Part(
                             id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
                             qty=p.qty, shape_type="rect", width=merged, height=H, points=None,
@@ -301,7 +301,7 @@ with right:
                         ))
                     else:
                         st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                        return [p]
+                        return [p], False
                 else:
                     parts_out.append(Part(
                         id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
@@ -313,8 +313,7 @@ with right:
                     remaining -= seam_gap
                 idx += 1
         else:
-            remaining = H
-            idx = 1
+            remaining = H; idx = 1
             while remaining > 1e-9:
                 panel = min(usable_h, remaining)
                 if panel < min_leg - 1e-9:
@@ -323,7 +322,7 @@ with right:
                         merged = prev.height + seam_gap + panel
                         if merged > usable_h + 1e-9:
                             st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
-                            return [p]
+                            return [p], False
                         parts_out.append(Part(
                             id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}",
                             qty=p.qty, shape_type="rect", width=W, height=merged, points=None,
@@ -331,7 +330,7 @@ with right:
                         ))
                     else:
                         st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                        return [p]
+                        return [p], False
                 else:
                     parts_out.append(Part(
                         id=str(uuid.uuid4()), label=f"{p.label}-S{idx}",
@@ -343,23 +342,28 @@ with right:
                     remaining -= seam_gap
                 idx += 1
 
-        return parts_out if parts_out else [p]
+        parts_list = parts_out if parts_out else [p]
+        did_split = len(parts_list) > 1
+        return parts_list, did_split
 
-    # ------- Rectpack wrapper (polygons use bbox for now) -------
+    # ------- Rectpack wrapper (polygons use bbox for now); rotation off if any split -------
     def _rectpack(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool):
-        packer = newPacker(rotation=rotation)
         to_add = []
-
-        # Expand parts by qty; auto-split rectangles if enabled
         expanded: List[Part] = []
+        any_split = False
+
         for p in parts:
             if p.qty <= 0: continue
             subs = [p]
             if autosplit and p.shape_type == "rect":
-                subs = split_rect_if_needed(p, sheet_w, sheet_h, min_leg, seam_gap, prefer_long_split == "long side")
+                subs, did_split = split_rect_if_needed(p, sheet_w, sheet_h, min_leg, seam_gap, prefer_long_split == "long side")
+                any_split = any_split or did_split
             for s in subs:
                 for _ in range(p.qty):
                     expanded.append(s)
+
+        rotation_effective = rotation and (not any_split)
+        packer = newPacker(rotation=rotation_effective)
 
         EPS = 1e-6
         for s in expanded:
@@ -416,12 +420,158 @@ with right:
                 st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global
             )
             st.session_state.needs_nest = False
+            st.session_state._open_editor = False  # close editor on new nest
 
-    # ------- Results / Preview -------
+    # ------- Messages -------
     if st.session_state.messages:
         for m in st.session_state.messages:
             st.warning(m)
 
+    # ------- Konva editor helper -------
+    def render_konva_editor(sheet_w, sheet_h, placements, units_label="in", grid=1.0):
+        data = {
+            "sheet_w": sheet_w, "sheet_h": sheet_h,
+            "units": units_label, "grid": grid, "rects": placements,
+        }
+        payload = json.dumps(data)
+
+        html = f"""
+        <div id="root"></div>
+        <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+        <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+        <script src="https://unpkg.com/konva@9.3.3/konva.min.js"></script>
+        <script>
+          const payload = {payload};
+          const scale = 8; // px per unit
+
+          const container = document.createElement('div');
+          container.style.border = '1px solid #ddd';
+          container.style.width = (payload.sheet_w*scale + 2) + 'px';
+          container.style.height = (payload.sheet_h*scale + 2) + 'px';
+          document.getElementById('root').appendChild(container);
+
+          const stage = new Konva.Stage({{
+            container: container,
+            width: payload.sheet_w*scale,
+            height: payload.sheet_h*scale
+          }});
+          const layer = new Konva.Layer();
+          stage.add(layer);
+
+          // grid
+          const gridSize = Math.max(1, Math.round(payload.grid*scale));
+          for (let x=0; x<=stage.width(); x+=gridSize) {{
+            layer.add(new Konva.Line({{ points:[x,0,x,stage.height()], stroke:'#f0f0f0', strokeWidth:1 }}));
+          }}
+          for (let y=0; y<=stage.height(); y+=gridSize) {{
+            layer.add(new Konva.Line({{ points:[0,y,stage.width(),y], stroke:'#f0f0f0', strokeWidth:1 }}));
+          }}
+
+          // sheet border
+          layer.add(new Konva.Rect({{
+            x:0, y:0, width:payload.sheet_w*scale, height:payload.sheet_h*scale,
+            stroke:'#222', strokeWidth:2
+          }}));
+
+          function snap(v, step) {{ return Math.round(v/step)*step; }}
+
+          const rectNodes = [];
+          payload.rects.forEach(r => {{
+            const node = new Konva.Group({{ x: r.x*scale, y: r.y*scale, draggable: true, id: r.rid }});
+            const shape = new Konva.Rect({{
+              x:0, y:0, width: r.w*scale, height: r.h*scale,
+              fill: 'rgba(100,150,250,0.15)', stroke: '#4074f4', strokeWidth: 1
+            }});
+            const label = new Konva.Text({{
+              x:2, y:2, text: r.label + "\\n" + (r.w.toFixed(2) + " × " + r.h.toFixed(2) + " " + payload.units),
+              fontSize: 12, fill: '#333'
+            }});
+            node.add(shape); node.add(label);
+            node.on('dragmove', () => {{
+              const step = gridSize;
+              node.x(snap(node.x(), step));
+              node.y(snap(node.y(), step));
+              layer.batchDraw();
+            }});
+            layer.add(node);
+            rectNodes.push({{ node, w:r.w, h:r.h, rid:r.rid, labelText:r.label }});
+          }});
+
+          layer.draw();
+
+          // expose a function to return JSON back to Streamlit
+          window.getKonvaState = () => {{
+            return rectNodes.map(obj => {{
+              return {{
+                rid: obj.rid,
+                label: obj.labelText,
+                x: obj.node.x()/scale,
+                y: obj.node.y()/scale,
+                w: obj.w, h: obj.h
+              }};
+            }});
+          }};
+        </script>
+        """
+        components.html(html, height=int(sheet_h*8)+30, scrolling=True)
+
+    # ------- Manual placement UI -------
+    if st.session_state.placements:
+        st.markdown("### Manual placement (beta)")
+        st.caption("Open an interactive editor to drag parts on a sheet. Snap-to-grid is enabled (default 0.5 in).")
+
+        sheet_count = len(st.session_state.placements)
+        sel_idx = st.number_input("Sheet number to edit", min_value=1, max_value=sheet_count, value=1, step=1)
+        sel = st.session_state.placements[sel_idx-1]
+
+        edit_cols = st.columns(2)
+        with edit_cols[0]:
+            if st.button("Open editor for selected sheet", use_container_width=True):
+                st.session_state._open_editor = True
+        with edit_cols[1]:
+            grid_snap = st.number_input(f"Grid snap ({_pretty_units(units)})", min_value=0.1, value=0.5, step=0.1, format="%.2f")
+
+        if st.session_state._open_editor:
+            st.info("Drag parts, then click **Apply manual placement** below.")
+            render_konva_editor(
+                sheet_w=sel["sheet_w"],
+                sheet_h=sel["sheet_h"],
+                placements=sel["placements"],
+                units_label=_pretty_units(units),
+                grid=float(grid_snap)
+            )
+
+            # Apply button (pulls JSON from the browser via query param)
+            components.html("""
+            <form method="get">
+              <input type="hidden" name="konva_state" id="ks">
+              <button type="submit" style="margin-top:8px;padding:8px 12px;">Apply manual placement</button>
+              <script>
+                try {
+                  const data = window.getKonvaState ? window.getKonvaState() : [];
+                  document.getElementById('ks').value = JSON.stringify(data);
+                } catch(e) {
+                  document.getElementById('ks').value = "[]";
+                }
+              </script>
+            </form>
+            """, height=60)
+
+            qp = st.query_params
+            if "konva_state" in qp and qp["konva_state"]:
+                try:
+                    new_rects = json.loads(qp["konva_state"])
+                    by_rid = {r["rid"]: r for r in new_rects}
+                    for plc in sel["placements"]:
+                        if plc["rid"] in by_rid:
+                            nr = by_rid[plc["rid"]]
+                            plc["x"] = float(nr["x"]); plc["y"] = float(nr["y"])
+                    st.success(f"Applied manual placement for Sheet {sel_idx}.")
+                    st.query_params.clear()
+                except Exception as e:
+                    st.warning(f"Could not apply manual placement: {e}")
+
+    # ------- Results / Preview -------
     if st.session_state.placements:
         util_pct = round(st.session_state.utilization * 100, 2)
         used_area = sum(p["w"] * p["h"] for s in st.session_state.placements for p in s["placements"])
