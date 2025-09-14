@@ -418,14 +418,16 @@ with left:
         l_poly_units = make_L_polygon(float(A), float(tA), float(B), float(angle))
         prev = go.Figure()
         x = [p[0] for p in l_poly_units]; y = [p[1] for p in l_poly_units]
-        prev.add_trace(go.Scatte
-r(x=x+[x[0]], y=y+[y[0]], mode="lines+markers", name="L"))
-        prev.update_yaxes(scaleanchor="x", scaleratio=1)
-        prev.update_layout(title="L preview", width=480, height=360, margin=dict(l=20,r=20,t=40,b=20))
-        st.plotly_chart(prev, use_container_width=True)
+prev.add_trace(go.Scatter(
+    x=x+[x[0]], y=y+[y[0]], mode="lines+markers", name="L"
+))
+prev.add_trace(go.Scatter(x=x+[x[0]], y=y+[y[0]], mode="lines+markers", name="L"))
+prev.update_yaxes(scaleanchor="x", scaleratio=1)
+prev.update_layout(title="L preview", width=480, height=360, margin=dict(l=20,r=20,t=40,b=20))
+st.plotly_chart(prev, use_container_width=True)
 
     # Add current shape (classic tools expander)
-    with st.expander("Add the current shape to the Parts list (classic tools)", expanded=(tool!="Rectangle" or not use_live_drawer)):
+with st.expander("Add the current shape to the Parts list (classic tools)", expanded=(tool!="Rectangle" or not use_live_drawer)):
         default_qty = st.number_input("Quantity", min_value=1, step=1, value=1, key="exp_qty")
         default_label = st.text_input("Label (optional)", value="", key="exp_label")
         allow_rot = st.checkbox("Allow rotation for this part (0/90°)", value=True, key="exp_rot")
