@@ -1,4 +1,4 @@
-# app.py — Polygon-aware nesting + L-split policy (Streamlit)
+# app.py — Polygon-aware nesting + L-split policy + live dims + bulk add + cutouts
 from __future__ import annotations
 
 import json, math, uuid
@@ -39,6 +39,7 @@ def _init_state():
     st.session_state.setdefault("utilization", 0.0)
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("_open_editor", False)
+    st.session_state.setdefault("draw_canvas_key", "draw_canvas")
 
 _init_state()
 
@@ -68,12 +69,35 @@ def _bbox_of_polygon(points: List[Tuple[float, float]]) -> Tuple[float, float]:
     xs = [p[0] for p in points]; ys = [p[1] for p in points]
     return (max(xs) - min(xs), max(ys) - min(ys))
 
+# ───────────────────────── Cutout helper ─────────────────────────
+def polygon_with_cutouts(outer_pts: List[Tuple[float,float]], cutouts: List[Tuple[float,float,float,float]]) -> Polygon:
+    """
+    outer_pts: polygon outline points (closed or open)
+    cutouts: list of (x, y, w, h) rectangles in same local coords as outer
+    returns shapely Polygon (may contain holes)
+    """
+    outer = Polygon(outer_pts)
+    holes = []
+    for (cx, cy, cw, ch) in cutouts:
+        hole_poly = shp_box(cx, cy, cx+cw, cy+ch)
+        inner = hole_poly.intersection(outer.buffer(0))
+        if not inner.is_empty:
+            if isinstance(inner, Polygon):
+                holes.append(list(inner.exterior.coords))
+    if holes:
+        return Polygon(outer.exterior.coords, holes=[[(x,y) for (x,y) in hole] for hole in holes])
+    return outer
+
 # ───────────────────────── Sidebar ─────────────────────────
 with st.sidebar:
     st.header("Project settings")
     units = st.selectbox("Units", ["in", "mm", "cm"], index=0)
     precision = st.number_input("Precision (decimals)", 0, 4, 2)
     px_per_unit = st.slider("Canvas scale (px per unit)", 2, 20, 8)
+
+    st.markdown("### Drawing canvas size")
+    canvas_w = st.number_input("Canvas width (px)", min_value=600, max_value=2000, value=1200, step=50)
+    canvas_h = st.number_input("Canvas height (px)", min_value=400, max_value=1400, value=700, step=50)
 
     st.markdown("### Sheet")
     sheet_w = st.number_input(f"Sheet width ({_pretty_units(units)})", min_value=1.0, value=97.0, step=1.0, format="%.2f")
@@ -82,7 +106,7 @@ with st.sidebar:
     allow_rotation_global = st.checkbox("Allow rotation globally (0/90°)", value=True)
 
     st.markdown("### Nesting mode")
-    mode = st.radio("Mode", ["Fast (rectpack)", "Precision (polygon-aware)"], index=0, help="Precision places true outlines; slower but more accurate for L-shapes.")
+    mode = st.radio("Mode", ["Fast (rectpack)", "Precision (polygon-aware)"], index=1, help="Precision places true outlines; slower but more accurate for L-shapes and cutouts.")
 
     st.markdown("### Auto-split oversized rectangles")
     autosplit_rects = st.checkbox("Auto-split rectangles that exceed sheet size", value=True)
@@ -93,11 +117,10 @@ with st.sidebar:
     st.markdown("### L-shape split policy")
     enable_L_seams = st.checkbox("Allow seams on L-shapes when needed", value=True)
     L_max_leg_no_split = st.number_input(f"Max leg length without split ({_pretty_units(units)})", min_value=1.0, value=48.0, step=1.0, format="%.0f")
-    # Depth equality assumption: tA == tB == D (can relax later)
 
     st.markdown("---")
     if st.button("🗑️ Clear project", use_container_width=True, type="primary"):
-        for k in ["parts", "needs_nest", "placements", "utilization", "messages", "_open_editor"]:
+        for k in ["parts", "needs_nest", "placements", "utilization", "messages", "_open_editor", "draw_canvas_key"]:
             st.session_state.pop(k, None)
         _init_state()
         st.success("Project cleared.")
@@ -116,22 +139,23 @@ with left:
     )
 
     # Drawing canvas for rect/polygon
-    canvas_w, canvas_h = 900, 520
-    last_obj = None; live_w = live_h = None
+    last_obj = None
+    live_w = live_h = None
 
     if tool in ["Rectangle", "Polygon (freehand)"]:
         drawing_mode = "rect" if tool == "Rectangle" else "polygon"
+        canvas_key = st.session_state.get("draw_canvas_key", "draw_canvas")
         canvas_result = st_canvas(
             fill_color="rgba(0,0,0,0.0)",
             stroke_width=2,
             stroke_color="#1f77b4",
             background_color="#fafafa",
-            height=canvas_h,
-            width=canvas_w,
+            height=int(canvas_h),
+            width=int(canvas_w),
             drawing_mode=drawing_mode,
             display_toolbar=True,
             update_streamlit=True,
-            key="draw_canvas"
+            key=canvas_key
         )
         if canvas_result and canvas_result.json_data:
             objs = canvas_result.json_data.get("objects", [])
@@ -147,7 +171,51 @@ with left:
                         bw, bh = _bbox_of_polygon(pts)
                         live_w = round(bw / px_per_unit, precision)
                         live_h = round(bh / px_per_unit, precision)
-        st.caption("**Live dimensions**: " + (f"{live_w} × {live_h} {_pretty_units(units)}" if live_w is not None else "— start/continue drawing —"))
+
+        col_live = st.columns(2)
+        with col_live[0]:
+            st.metric("Live width", f"{live_w if live_w is not None else '—'} {_pretty_units(units)}")
+        with col_live[1]:
+            st.metric("Live height", f"{live_h if live_h is not None else '—'} {_pretty_units(units)}")
+
+        # Bulk actions for drawn shapes
+        bulk_cols = st.columns([1,1,1])
+        with bulk_cols[0]:
+            if st.button("➕ Add all drawn shapes", type="secondary"):
+                added = 0
+                if canvas_result and canvas_result.json_data:
+                    objs = canvas_result.json_data.get("objects", [])
+                    for obj in objs:
+                        if obj.get("type") == "rect":
+                            w_px, h_px = _fabric_rect_dims(obj)
+                            w = round(w_px / px_per_unit, precision)
+                            h = round(h_px / px_per_unit, precision)
+                            if w > 0 and h > 0:
+                                st.session_state.parts.append(Part(
+                                    id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
+                                    qty=1, shape_type="rect", width=float(w), height=float(h),
+                                    points=None, allow_rotation=True
+                                ))
+                                added += 1
+                        elif obj.get("path"):
+                            pts = _fabric_polygon_points(obj)
+                            if len(pts) >= 3:
+                                pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
+                                st.session_state.parts.append(Part(
+                                    id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
+                                    qty=1, shape_type="polygon", width=None, height=None,
+                                    points=pts_units, allow_rotation=True
+                                ))
+                                added += 1
+                if added:
+                    st.session_state.needs_nest = True
+                    st.success(f"Added {added} shape(s) from the drawing layer.")
+        with bulk_cols[1]:
+            if st.button("🧹 Clear drawing layer"):
+                st.session_state["draw_canvas_key"] = uuid.uuid4().hex
+                st.rerun()
+        with bulk_cols[2]:
+            st.caption("Tip: draw multiple shapes first, then **Add all**.")
 
     # Parametric L-shape
     l_poly_units = None; A=B=tA=tB=angle=None
@@ -159,11 +227,10 @@ with left:
             tA = st.number_input(f"Depth / thickness D ({_pretty_units(units)})", min_value=0.1, value=25.0, step=0.1, format="%.2f")
         with colB:
             B = st.number_input(f"Outer leg B length ({_pretty_units(units)})", min_value=1.0, value=60.0, step=0.5, format="%.2f")
-            tB = tA  # assume equal depths for now
+            tB = tA  # equal depths for now
         angle = st.number_input("Inside angle (degrees)", min_value=30.0, max_value=150.0, value=90.0, step=1.0, format="%.0f")
 
         def make_L_polygon(A, D, B, angle_deg) -> List[Tuple[float, float]]:
-            # Right-angle base L outline; rotate if angle != 90
             pts = [(0,0),(A,0),(A,D),(D,D),(D,B),(0,B),(0,0)]
             if abs(angle_deg - 90.0) > 1e-6:
                 theta = math.radians(90.0 - angle_deg)
@@ -179,11 +246,30 @@ with left:
         prev.update_layout(title="L preview", width=480, height=360, margin=dict(l=20,r=20,t=40,b=20))
         st.plotly_chart(prev, use_container_width=True)
 
-    # Add current shape
+    # Add current shape (with optional cutouts)
     with st.expander("Add the current shape to the Parts list", expanded=True):
         default_qty = st.number_input("Quantity", min_value=1, step=1, value=1)
         default_label = st.text_input("Label (optional)", value="")
         allow_rot = st.checkbox("Allow rotation for this part (0/90°)", value=True)
+
+        st.markdown("**Optional: rectangular cutouts (sinks, cooktops)**")
+        add_cut = st.checkbox("Add cutout(s) to this part")
+        cut_list: List[Tuple[float,float,float,float]] = []
+        if add_cut:
+            ncuts = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1)
+            for i in range(ncuts):
+                st.write(f"Cutout #{i+1}")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f")
+                with c2:
+                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f")
+                with c3:
+                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f")
+                with c4:
+                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f")
+                cut_list.append((cx, cy, cw, ch))
+
         if st.button("➕ Add this shape", type="secondary"):
             if tool == "Rectangle":
                 if not last_obj or last_obj.get("type") != "rect":
@@ -194,14 +280,26 @@ with left:
                     if w <= 0 or h <= 0:
                         st.error("This rectangle has zero width/height.")
                     else:
-                        st.session_state.parts.append(Part(
-                            id=str(uuid.uuid4()), label=default_label or f"Draw-{len(st.session_state.parts)+1}",
-                            qty=int(default_qty), shape_type="rect",
-                            width=float(w), height=float(h), points=None,
-                            allow_rotation=bool(allow_rot)
-                        ))
+                        if add_cut and cut_list:
+                            outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
+                            poly = polygon_with_cutouts(outer, cut_list)
+                            st.session_state.parts.append(Part(
+                                id=str(uuid.uuid4()), label=default_label or f"Rect-{len(st.session_state.parts)+1}",
+                                qty=int(default_qty), shape_type="polygon",
+                                width=None, height=None, points=list(poly.exterior.coords),
+                                allow_rotation=bool(allow_rot),
+                                meta={"cutouts": cut_list}
+                            ))
+                            st.success(f"Added rectangle (with {len(cut_list)} cutout(s))")
+                        else:
+                            st.session_state.parts.append(Part(
+                                id=str(uuid.uuid4()), label=default_label or f"Rect-{len(st.session_state.parts)+1}",
+                                qty=int(default_qty), shape_type="rect",
+                                width=float(w), height=float(h), points=None,
+                                allow_rotation=bool(allow_rot)
+                            ))
+                            st.success(f"Added rectangle ({w} × {h} {_pretty_units(units)})")
                         st.session_state.needs_nest = True
-                        st.success(f"Added rectangle ({w} × {h} {_pretty_units(units)})")
 
             elif tool == "Polygon (freehand)":
                 if not last_obj or not last_obj.get("path"):
@@ -212,8 +310,9 @@ with left:
                         st.error("Polygon needs at least 3 points.")
                     else:
                         pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
+                        # (Cutouts for freehand polygons could be supported later)
                         st.session_state.parts.append(Part(
-                            id=str(uuid.uuid4()), label=default_label or f"Draw-{len(st.session_state.parts)+1}",
+                            id=str(uuid.uuid4()), label=default_label or f"Poly-{len(st.session_state.parts)+1}",
                             qty=int(default_qty), shape_type="polygon",
                             width=None, height=None, points=pts_units,
                             allow_rotation=bool(allow_rot)
@@ -225,15 +324,25 @@ with left:
                 if not l_poly_units or len(l_poly_units) < 3:
                     st.error("L-shape parameters invalid.")
                 else:
+                    meta = {"is_L": True, "A": float(A), "B": float(B), "tA": float(tA), "tB": float(tB), "angle": float(angle)}
+                    if add_cut and cut_list:
+                        poly = polygon_with_cutouts(l_poly_units, cut_list)
+                        meta["cutouts"] = cut_list
+                        pts_out = list(poly.exterior.coords)
+                    else:
+                        pts_out = l_poly_units
                     st.session_state.parts.append(Part(
                         id=str(uuid.uuid4()), label=default_label or f"L-{len(st.session_state.parts)+1}",
                         qty=int(default_qty), shape_type="polygon",
-                        width=None, height=None, points=l_poly_units,
+                        width=None, height=None, points=pts_out,
                         allow_rotation=bool(allow_rot),
-                        meta={"is_L": True, "A": float(A), "B": float(B), "tA": float(tA), "tB": float(tB), "angle": float(angle)}
+                        meta=meta
                     ))
                     st.session_state.needs_nest = True
-                    st.success("Added L-shape.")
+                    if add_cut and cut_list:
+                        st.success("Added L-shape (with cutout(s)).")
+                    else:
+                        st.success("Added L-shape.")
 
     # Parts editor
     st.markdown("---")
@@ -337,7 +446,7 @@ with right:
         return (parts_out if parts_out else [p]), (len(parts_out) > 1)
 
     def decompose_L_prefer_corner(p: Part) -> list[Part]:
-        """Default corner split: Rect1=(A-D)×D (long leg), Rect2=B×D (short leg)."""
+        """Default corner split: Rect1=(A-D)×D, Rect2=B×D."""
         m = p.meta or {}
         if not m.get("is_L"): return [p]
         if abs(float(m.get("angle", 90.0)) - 90.0) > 1e-6: return [p]
@@ -371,7 +480,6 @@ with right:
         expanded: List[Part] = []
         any_split = False
 
-        # Expand & split per rules
         for p in parts:
             if p.qty <= 0: continue
             subs = [p]
@@ -380,17 +488,17 @@ with right:
             # L split policy
             if p.meta.get("is_L") and enable_L_seams and abs(p.meta.get("angle", 90.0) - 90.0) < 1e-6:
                 A = float(p.meta.get("A", 0.0)); B = float(p.meta.get("B", 0.0)); D = float(p.meta.get("tA", 0.0))
-                # No split if both legs <= threshold and it fits sheet
-                if not (A <= L_max_leg_no_split and B <= L_max_leg_no_split and A <= sheet_w and B <= sheet_h):
-                    # Try corner-first vs alternate and pick better (fewest sheets) using a tiny dry-run
-                    cand1 = decompose_L_prefer_corner(p)  # [(A-D)xD, BxD]
-                    cand2 = decompose_L_alternate(p)      # [A x D, (B-D)xD]
+                # Keep intact only if both legs <= threshold AND the L fits the sheet
+                fits_sheet = (A <= sheet_w and B <= sheet_h)
+                if not (A <= L_max_leg_no_split and B <= L_max_leg_no_split and fits_sheet):
+                    cand1 = decompose_L_prefer_corner(p)
+                    cand2 = decompose_L_alternate(p)
                     s1, _ = _rectpack_trial(cand1, sheet_w, sheet_h, clearance, rotation)
                     s2, _ = _rectpack_trial(cand2, sheet_w, sheet_h, clearance, rotation)
                     subs = cand1 if len(s1) <= len(s2) else cand2
                     did_split = True
 
-            # Rectangle auto-split (secondary; honor "split on other end" by not re-splitting the other leg we just split)
+            # Rectangle auto-split
             if autosplit_rects:
                 next_subs = []
                 for s in subs:
@@ -416,7 +524,6 @@ with right:
                 w = min(s.width + clearance, sheet_w - EPS)
                 h = min(s.height + clearance, sheet_h - EPS)
             else:
-                # polygons -> pack by bbox
                 if s.points:
                     poly = Polygon(s.points); minx, miny, maxx, maxy = poly.bounds
                     w = min((maxx - minx) + clearance, sheet_w - EPS)
@@ -462,33 +569,42 @@ with right:
 
     def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool, grid_step: float = 0.5):
         """
-        Polygon-aware greedy placer:
-          - Converts each part instance to a Shapely polygon (rects -> rectangles; L/polygons -> true outline).
-          - Tries (0°) and (90°) if rotation allowed.
-          - Scans positions on a grid (grid_step) left-to-right, top-to-bottom.
-          - Places if (within sheet) and (no intersection with placed polys buffered by clearance/2).
+        Polygon-aware greedy placer (0/90°):
+          - Part → Shapely polygon (rects true rects; polygons true outlines; cutouts as holes).
+          - Scan a grid (grid_step) L-to-R, T-to-B.
+          - Place if within sheet and no collisions (clearance/2 buffered).
+          - Starts a new sheet when no position fits.
         """
-        # Expand parts by qty and apply L split policy first (panelization when needed)
         expanded: List[Tuple[Part, Polygon]] = []
         any_split = False
 
         def part_to_poly(s: Part) -> Polygon | None:
             if s.shape_type == "rect" and s.width and s.height:
-                return shp_box(0, 0, s.width, s.height)
+                outer = shp_box(0, 0, s.width, s.height)
+                if s.meta.get("cutouts"):
+                    diff = outer
+                    for (cx,cy,cw,ch) in s.meta["cutouts"]:
+                        diff = diff.difference(shp_box(cx, cy, cx+cw, cy+ch))
+                    return diff
+                return outer
             if s.shape_type == "polygon" and s.points:
                 try:
-                    return Polygon(s.points)
+                    poly = Polygon(s.points)
+                    if s.meta.get("cutouts"):
+                        for (cx,cy,cw,ch) in s.meta["cutouts"]:
+                            poly = poly.difference(shp_box(cx, cy, cx+cw, cy+ch))
+                    return poly
                 except Exception:
                     return None
             return None
 
+        # Expand + apply L policy + rect auto-split
         for p in parts:
             if p.qty <= 0: continue
             subs = [p]; did_split = False
 
             if p.meta.get("is_L") and enable_L_seams and abs(p.meta.get("angle",90.0)-90.0) < 1e-6:
                 A = float(p.meta.get("A",0.0)); B = float(p.meta.get("B",0.0)); D = float(p.meta.get("tA",0.0))
-                # Don't split only if both legs <= threshold and L fits sheet
                 L_poly = part_to_poly(p)
                 fits_sheet = False
                 if L_poly is not None:
@@ -502,7 +618,6 @@ with right:
                     subs = cand1 if len(s1) <= len(s2) else cand2
                     did_split = True
 
-            # Rectangle auto-split if still too big (applies “second split on other end” by splitting whichever leg still exceeds)
             if autosplit_rects:
                 next_subs = []
                 for s in subs:
@@ -524,7 +639,6 @@ with right:
 
         rotation_effective = rotation and (not any_split)
 
-        # Placement
         placed = []  # list of dicts with polygon+meta
         sheet_poly = shp_box(0, 0, sheet_w, sheet_h)
         buffer_clear = clearance / 2.0 if clearance > 0 else 0.0
@@ -536,17 +650,14 @@ with right:
 
             for ang in orientations:
                 poly = shp_rotate(base_poly, ang, origin=(0,0), use_radians=False)
-                # scan grid
                 y = 0.0
                 while y <= sheet_h and not placed_ok:
                     x = 0.0
                     while x <= sheet_w and not placed_ok:
                         test = shp_translate(poly, xoff=x, yoff=y)
-                        # bounds check with clearance
                         bounds_ok = test.buffer(buffer_clear).within(sheet_poly)
                         if not bounds_ok:
                             x += grid_step; continue
-                        # collision check
                         collision = False
                         for other in placed:
                             if test.buffer(buffer_clear).intersects(other["poly"].buffer(buffer_clear)):
@@ -560,24 +671,21 @@ with right:
                 if placed_ok: break
 
             if not placed_ok:
-                # start a new sheet: finalize current and start placement anew
-                # collect current sheet placements
+                # finalize current sheet and start new
                 yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
                     _poly_to_rect_anno(d["poly"], d["label"], precision) for d in placed
                 ]}
                 placed = []
-                # place this part on the new sheet at (0,0) if possible
+                # place this part at origin on new sheet if possible (0 or 90)
                 poly0 = shp_rotate(base_poly, 0, origin=(0,0), use_radians=False)
                 if poly0.buffer(buffer_clear).within(sheet_poly):
                     placed.append({"poly": poly0, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": 0})
                 else:
-                    # try 90 if allowed
                     poly90 = shp_rotate(base_poly, 90, origin=(0,0), use_radians=False)
                     if rotation_effective and poly90.buffer(buffer_clear).within(sheet_poly):
                         placed.append({"poly": poly90, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": 90})
                     else:
                         st.session_state.messages.append(f"⚠️ {s.label}: cannot place on empty sheet (too large).")
-        # flush last sheet
         if placed:
             yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
                 _poly_to_rect_anno(d["poly"], d["label"], precision) for d in placed
@@ -601,13 +709,11 @@ with right:
                 sheets, util = rectpack_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global)
                 st.session_state.placements, st.session_state.utilization = sheets, util
             else:
-                # Precision mode returns a generator of sheets
                 sheets = list(poly_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global, grid_step=0.5))
-                # utilization by true polygon area
                 placed_area = 0.0
                 for s in sheets:
                     for p in s["placements"]:
-                        placed_area += p["w"] * p["h"]  # bbox area as a lower bound
+                        placed_area += p["w"] * p["h"]  # bbox area lower bound
                 util = placed_area / max(1e-9, len(sheets)*sheet_w*sheet_h)
                 st.session_state.placements, st.session_state.utilization = sheets, util
             st.session_state.needs_nest = False
