@@ -1,1010 +1,523 @@
-# app.py — Polygon-aware nesting + L-split policy + live drawer + bulk add + cutouts
-from __future__ import annotations
+# app.py
+# Nesting Tool – Streamlit
+# Features:
+# • Large drawing canvas (resizable)
+# • Live dimensions display while dragging (rectangles)
+# • Add single shape OR queue multiple and “Add All”
+# • L-shape wizard with default 90° split at the inside corner
+# • Cutouts (sink/cooktop) stored under parent shape
+# • Polygon-aware: store polygon vertices; placeholder for nesting
+# • Robust session_state to avoid “not adding to parts list” bugs
 
-import json, math, uuid
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Any
+import math
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
-import plotly.graph_objects as go
-from rectpack import newPacker
-from shapely.affinity import rotate as shp_rotate, translate as shp_translate
-from shapely.geometry import Polygon, box as shp_box
-from shapely.ops import unary_union
-
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
-import streamlit.components.v1 as components
+from PIL import Image, ImageColor
 
+# -------------------------- Page setup --------------------------
 st.set_page_config(page_title="Nesting Tool", layout="wide")
-SHOW_CSV = False  # draw-only workflow
 
-# ───────────────────────── Data model / state ─────────────────────────
+# -------------------------- Helpers & Data Models --------------------------
 @dataclass
-class Part:
-    id: str
+class Cutout:
+    kind: str  # 'sink' | 'cooktop' | 'other'
+    x: float   # top-left x in same units as parent (inches)
+    y: float   # top-left y
+    w: float
+    h: float
+
+@dataclass
+class RectShape:
+    shape_id: str
     label: str
+    w: float
+    h: float
     qty: int
-    shape_type: str            # "rect" or "polygon"
-    width: float | None
-    height: float | None
-    points: List[Tuple[float, float]] | None
-    allow_rotation: bool = True
-    meta: Dict[str, Any] = field(default_factory=dict)
+    note: str = ""
+    cutouts: List[Cutout] = None
 
-def _init_state():
-    st.session_state.setdefault("parts", [])
-    st.session_state.setdefault("needs_nest", True)
-    st.session_state.setdefault("placements", [])
-    st.session_state.setdefault("utilization", 0.0)
-    st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("_open_editor", False)
-    st.session_state.setdefault("draw_canvas_key", "draw_canvas")
+@dataclass
+class LShape:
+    shape_id: str
+    label: str
+    outer_w: float
+    outer_h: float
+    notch_w: float
+    notch_h: float
+    qty: int
+    # auto-split yields two rectangles
+    note: str = "L-shape (auto split 90° at inside corner)"
 
-_init_state()
+@dataclass
+class PolyShape:
+    shape_id: str
+    label: str
+    points: List[Tuple[float, float]]  # in inches
+    qty: int
+    note: str = "Polygon part"
 
-def _pretty_units(u: str) -> str:
-    return {"in": "in", "mm": "mm", "cm": "cm"}[u]
+def init_state():
+    ss = st.session_state
+    ss.setdefault("ppi", 8.0)  # pixels per inch (scale)
+    ss.setdefault("parts", [])  # committed parts list (Rect/L/Poly normalized to rows)
+    ss.setdefault("pending", [])  # shapes queued from canvas before commit
+    ss.setdefault("selected_parent_for_cutout", None)
+    ss.setdefault("last_drawn_dims", None)  # (w,h) live display
+    ss.setdefault("shape_counter", 1)
+    ss.setdefault("canvas_key_bump", 0)  # force rerender when needed
 
-# ───────────────────────── Fabric helpers ─────────────────────────
-def _fabric_rect_dims(obj: Dict) -> Tuple[float, float]:
-    w = float(obj.get("width", 0)) * float(obj.get("scaleX", 1.0))
-    h = float(obj.get("height", 0)) * float(obj.get("scaleY", 1.0))
-    return abs(w), abs(h)
+init_state()
 
-def _fabric_polygon_points(obj: Dict) -> List[Tuple[float, float]]:
-    pts = []
-    path = obj.get("path")
-    if isinstance(path, list):
-        x0 = float(obj.get("left", 0)); y0 = float(obj.get("top", 0))
-        sx = float(obj.get("scaleX", 1.0)); sy = float(obj.get("scaleY", 1.0))
-        for seg in path:
-            if isinstance(seg, list) and len(seg) >= 3 and seg[0] in ("L", "M"):
-                px = x0 + float(seg[1]) * sx
-                py = y0 + float(seg[2]) * sy
-                pts.append((px, py))
-    return pts
+def px_to_in(val_px: float, ppi: float) -> float:
+    return round(val_px / ppi, 3)
 
-def _bbox_of_polygon(points: List[Tuple[float, float]]) -> Tuple[float, float]:
-    xs = [p[0] for p in points]; ys = [p[1] for p in points]
-    return (max(xs) - min(xs), max(ys) - min(ys))
+def in_to_px(val_in: float, ppi: float) -> int:
+    return int(round(val_in * ppi))
 
-# ───────────────────────── Cutout helper ─────────────────────────
-def polygon_with_cutouts(outer_pts: List[Tuple[float,float]], cutouts: List[Tuple[float,float,float,float]]) -> Polygon:
-    """
-    outer_pts: polygon outline points (closed or open)
-    cutouts: list of (x, y, w, h) rectangles in same local coords as outer
-    returns shapely Polygon (may contain holes)
-    """
-    outer = Polygon(outer_pts)
-    holes = []
-    for (cx, cy, cw, ch) in cutouts:
-        hole_poly = shp_box(cx, cy, cx+cw, cy+ch)
-        inner = hole_poly.intersection(outer.buffer(0))
-        if not inner.is_empty:
-            if isinstance(inner, Polygon):
-                holes.append(list(inner.exterior.coords))
-    if holes:
-        return Polygon(outer.exterior.coords, holes=[[(x,y) for (x,y) in hole] for hole in holes])
-    return outer
+def next_shape_id() -> str:
+    st.session_state.shape_counter += 1
+    return f"S{st.session_state.shape_counter:04d}"
 
-# ───────────────────────── Konva live rectangle drawer ─────────────────────────
-def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px=600):
-    """
-    Konva-based rectangle drawer with live dimension overlay.
-    Returns nothing directly; we pull JSON via a query param when user clicks the button below.
-    JSON payload: {"w":float,"h":float}
-    """
-    payload = json.dumps({"units": units_label, "ppu": ppu, "w": int(width_px), "h": int(height_px)})
-
-    html = f"""
-    <div id="konva-live-root"></div>
-    <script src="https://unpkg.com/konva@9.3.3/konva.min.js"></script>
-    <script>
-      const cfg = {payload};
-      const scale = cfg.ppu;
-
-      const container = document.createElement('div');
-      container.style.border = '1px solid #ddd';
-      container.style.width = cfg.w + 'px';
-      container.style.height = cfg.h + 'px';
-      document.getElementById('konva-live-root').appendChild(container);
-
-      const stage = new Konva.Stage({{ container: container, width: cfg.w, height: cfg.h }});
-      const layer = new Konva.Layer(); stage.add(layer);
-
-      let start = null, rect = null, label = null;
-
-      const hint = new Konva.Text({{
-        x: 8, y: 8, text: 'Drag to draw a rectangle', fontSize: 14, fill: '#333'
-      }});
-      layer.add(hint);
-
-      function fmt(v) {{ return (v/scale).toFixed(2); }}
-
-      stage.on('mousedown', () => {{
-        const pos = stage.getPointerPosition();
-        start = {{ x: pos.x, y: pos.y }};
-        if (rect) rect.destroy();
-        if (label) label.destroy();
-        rect = new Konva.Rect({{
-          x: start.x, y: start.y, width: 0, height: 0,
-          stroke: '#4074f4', strokeWidth: 1, dash: [4, 3]
-        }});
-        label = new Konva.Label({{ x: start.x + 8, y: start.y - 26 }});
-        label.add(new Konva.Tag({{ fill: 'rgba(255,255,255,0.9)', stroke: '#aaa' }}));
-        label.add(new Konva.Text({{
-          text: '', fontSize: 12, fill: '#111', padding: 4
-        }}));
-        layer.add(rect); layer.add(label);
-        layer.draw();
-      }});
-
-      stage.on('mousemove', () => {{
-        if (!start || !rect) return;
-        const pos = stage.getPointerPosition();
-        const w = pos.x - start.x;
-        const h = pos.y - start.y;
-        rect.width(w); rect.height(h);
-        const txt = label.getChildren()[1];
-        txt.text(fmt(Math.abs(w)) + ' × ' + fmt(Math.abs(h)) + ' ' + cfg.units);
-        label.position({{ x: start.x + 8, y: start.y - 26 }});
-        layer.batchDraw();
-      }});
-
-      stage.on('mouseup', () => {{
-        start = null;
-      }});
-
-      // Expose getter for Streamlit: returns latest rect dims in units.
-      window.getLiveRect = () => {{
-        if (!rect) return {{ w: 0, h: 0 }};
-        return {{ w: Math.abs(rect.width())/scale, h: Math.abs(rect.height())/scale }};
-      }};
-    </script>
-    """
-    components.html(html, height=int(height_px)+10, scrolling=False)
-
-# ───────────────────────── Sidebar ─────────────────────────
-with st.sidebar:
-    st.header("Project settings")
-    units = st.selectbox("Units", ["in", "mm", "cm"], index=0)
-    precision = st.number_input("Precision (decimals)", 0, 4, 2)
-    px_per_unit = st.slider("Canvas scale (px per unit)", 2, 20, 8)
-
-    st.markdown("### Drawing canvas size")
-    canvas_w = st.number_input("Canvas width (px)", min_value=600, max_value=2000, value=1200, step=50)
-    canvas_h = st.number_input("Canvas height (px)", min_value=400, max_value=1400, value=700, step=50)
-
-    st.markdown("### Sheet")
-    sheet_w = st.number_input(f"Sheet width ({_pretty_units(units)})", min_value=1.0, value=97.0, step=1.0, format="%.2f")
-    sheet_h = st.number_input(f"Sheet height ({_pretty_units(units)})", min_value=1.0, value=80.50, step=1.0, format="%.2f")
-    clearance = st.number_input(f"Clearance between parts ({_pretty_units(units)})", min_value=0.0, value=0.25, step=0.05, format="%.2f")
-    allow_rotation_global = st.checkbox("Allow rotation globally (0/90°)", value=True)
-
-    st.markdown("### Nesting mode")
-    mode = st.radio("Mode", ["Fast (rectpack)", "Precision (polygon-aware)"], index=1, help="Precision places true outlines; slower but more accurate for L-shapes and cutouts.")
-
-    st.markdown("### Auto-split oversized rectangles")
-    autosplit_rects = st.checkbox("Auto-split rectangles that exceed sheet size", value=True)
-    seam_gap = st.number_input(f"Seam/kerf gap at split ({_pretty_units(units)})", min_value=0.0, value=0.125, step=0.01, format="%.3f")
-    min_leg = st.number_input(f"Minimum leg length after split ({_pretty_units(units)})", min_value=1.0, value=6.0, step=0.5, format="%.2f")
-    prefer_long_split = st.selectbox("Prefer split along", ["long side", "short side"], index=0)
-
-    st.markdown("### L-shape split policy")
-    enable_L_seams = st.checkbox("Allow seams on L-shapes when needed", value=True)
-    L_max_leg_no_split = st.number_input(f"Max leg length without split ({_pretty_units(units)})", min_value=1.0, value=48.0, step=1.0, format="%.0f")
-
-    st.markdown("---")
-    if st.button("🗑️ Clear project", use_container_width=True, type="primary"):
-        for k in ["parts", "needs_nest", "placements", "utilization", "messages", "_open_editor", "draw_canvas_key"]:
-            st.session_state.pop(k, None)
-        _init_state()
-        st.success("Project cleared.")
-
-# ───────────────────────── Main layout ─────────────────────────
-left, right = st.columns([0.55, 0.45])
-
-with left:
-    st.title("Nesting Tool")
-
-    # Tool chooser
-    tool = st.radio(
-        "Tool",
-        ["Rectangle", "Polygon (freehand)", "L-shape (parametric)"],
-        horizontal=False
+def add_rect_to_pending(label: str, w: float, h: float, qty: int, note: str = ""):
+    st.session_state.pending.append(
+        {"type": "rect", "data": asdict(RectShape(next_shape_id(), label, w, h, qty, note, []))}
     )
 
-    # Toggle: Konva live drawer for rectangles
-    use_live_drawer = False
-    if tool == "Rectangle":
-        use_live_drawer = st.toggle("Use live drawer (beta)", value=True, help="Shows W×H while dragging (Konva). Turn off to use classic canvas with bulk-add.")
+def add_lshape_to_pending(label: str, outer_w: float, outer_h: float, notch_w: float, notch_h: float, qty: int):
+    st.session_state.pending.append(
+        {"type": "lshape", "data": asdict(LShape(next_shape_id(), label, outer_w, outer_h, notch_w, notch_h, qty))}
+    )
 
-    # Drawing canvas (two paths: live Konva drawer for rectangles OR classic streamlit-drawable-canvas)
-    last_obj = None
-    live_w = live_h = None
-    canvas_result = None  # only set for classic path
+def add_poly_to_pending(label: str, points_in: List[Tuple[float, float]], qty: int, note: str = "Polygon part"):
+    st.session_state.pending.append(
+        {"type": "poly", "data": asdict(PolyShape(next_shape_id(), label, points_in, qty, note))}
+    )
 
-    if tool == "Rectangle" and use_live_drawer:
-        # Live Konva drawer
-        render_konva_rect_drawer(
-            units_label=_pretty_units(units),
-            ppu=float(px_per_unit),
-            width_px=int(canvas_w),
-            height_px=int(canvas_h)
-        )
+def split_lshape_into_rects(outer_w, outer_h, notch_w, notch_h) -> List[Tuple[float, float]]:
+    """
+    Default split: 90° at inside corner of the L.
+    We return two rectangles that tile the L. A simple consistent choice:
+    - Rect A: (outer_w - notch_w) by outer_h
+    - Rect B: notch_w by (outer_h - notch_h)
+    """
+    a_w = max(outer_w - notch_w, 0)
+    a_h = outer_h
+    b_w = notch_w
+    b_h = max(outer_h - notch_h, 0)
+    rects = []
+    if a_w > 0 and a_h > 0:
+        rects.append((a_w, a_h))
+    if b_w > 0 and b_h > 0:
+        rects.append((b_w, b_h))
+    return rects
 
-        # Inputs next to the live drawer
-        lc1, lc2, lc3 = st.columns([2,1,1])
-        with lc1:
-            live_label = st.text_input("Label (optional)", value="", key="live_rect_label")
-        with lc2:
-            live_qty = st.number_input("Qty", min_value=1, value=1, step=1, key="live_rect_qty")
-        with lc3:
-            live_allow_rot = st.checkbox("Allow rotation", value=True, key="live_rect_rot")
-
-        st.markdown("**Optional: rectangular cutouts for this rectangle**")
-        add_cut_live = st.checkbox("Add cutout(s) to this rectangle", key="live_rect_cut_toggle")
-        cut_list_live: List[Tuple[float,float,float,float]] = []
-        if add_cut_live:
-            ncuts_live = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1, key="live_rect_cut_count")
-            for i in range(ncuts_live):
-                st.write(f"Cutout #{i+1}")
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f", key=f"lr_cw_{i}")
-                with c2:
-                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f", key=f"lr_ch_{i}")
-                with c3:
-                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"lr_cx_{i}")
-                with c4:
-                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"lr_cy_{i}")
-                cut_list_live.append((cx, cy, cw, ch))
-
-        # Button to pull dims from the browser and add the rectangle
-        add_live_clicked = st.button("➕ Add this rectangle", type="secondary", key="btn_add_live_rect")
-        # Submit a tiny form inside the iframe, but target the parent page so the URL updates.
-if add_live_clicked:
-    components.html("""
-    <form method="get" target="_parent" action="">
-      <input type="hidden" name="live_rect" id="lr">
-      <button type="submit" style="display:none;">submit</button>
-      <script>
-        try {
-          const data = window.getLiveRect ? window.getLiveRect() : {w:0,h:0};
-          document.getElementById('lr').value = JSON.stringify(data);
-          document.forms[0].submit();
-        } catch(e) {}
-      </script>
-    </form>
-    """, height=0)
-
-# ---- Read & consume the query param robustly (supports older Streamlit too)
-def _get_query_params():
-    # Newer Streamlit: st.query_params (Mapping)
-    if hasattr(st, "query_params"):
-        return st.query_params
-    # Older Streamlit fallback:
-    try:
-        return st.experimental_get_query_params()
-    except Exception:
-        return {}
-
-def _clear_query_params():
-    try:
-        if hasattr(st, "query_params"):
-            st.query_params.clear()
-        else:
-            st.experimental_set_query_params()  # clears
-    except Exception:
-        pass
-
-qp = _get_query_params()
-raw = qp.get("live_rect")
-# Some versions return a list; normalize to a string
-if isinstance(raw, list):
-    raw = raw[0] if raw else None
-
-if raw:
-    try:
-        vals = json.loads(raw)
-        w = float(vals.get("w", 0.0))
-        h = float(vals.get("h", 0.0))
-        if w <= 0 or h <= 0:
-            st.warning("Draw a rectangle first (drag on the canvas).")
-        else:
-            if add_cut_live and cut_list_live:
-                outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
-                poly = polygon_with_cutouts(outer, cut_list_live)
-                st.session_state.parts.append(Part(
-                    id=str(uuid.uuid4()),
-                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                    qty=int(live_qty),
-                    shape_type="polygon",
-                    width=None, height=None,
-                    points=list(poly.exterior.coords),
-                    allow_rotation=bool(live_allow_rot),
-                    meta={"cutouts": cut_list_live}
-                ))
-                st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
-            else:
-                st.session_state.parts.append(Part(
-                    id=str(uuid.uuid4()),
-                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                    qty=int(live_qty),
-                    shape_type="rect",
-                    width=w, height=h, points=None,
-                    allow_rotation=bool(live_allow_rot)
-                ))
-                st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
-            st.session_state.needs_nest = True
-    except Exception as e:
-        st.warning(f"Could not read live rectangle: {e}")
-    finally:
-        _clear_query_params()
-            
-
-        # Read result from query params
-        qp = st.query_params
-raw = qp.get("live_rect")
-# Streamlit may return a list in some versions; normalize to string
-if isinstance(raw, list):
-    raw = raw[0] if raw else None
-if raw:
-    try:
-        vals = json.loads(raw)
-        w = float(vals.get("w", 0.0))
-        h = float(vals.get("h", 0.0))
-        if w <= 0 or h <= 0:
-            st.warning("Draw a rectangle first (drag on the canvas).")
-        else:
-            if add_cut_live and cut_list_live:
-                outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
-                poly = polygon_with_cutouts(outer, cut_list_live)
-                st.session_state.parts.append(Part(
-                    id=str(uuid.uuid4()),
-                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                    qty=int(live_qty),
-                    shape_type="polygon",
-                    width=None, height=None,
-                    points=list(poly.exterior.coords),
-                    allow_rotation=bool(live_allow_rot),
-                    meta={"cutouts": cut_list_live}
-                ))
-                st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
-            else:
-                st.session_state.parts.append(Part(
-                    id=str(uuid.uuid4()),
-                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                    qty=int(live_qty),
-                    shape_type="rect",
-                    width=w, height=h, points=None,
-                    allow_rotation=bool(live_allow_rot)
-                ))
-                st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
-            st.session_state.needs_nest = True
-    except Exception as e:
-        st.warning(f"Could not read live rectangle: {e}")
-    finally:
-        # Clear the query params so the add doesn't re-trigger on refresh
-        try:
-            st.query_params.clear()
-        except Exception:
-            # Fallback for older Streamlit versions
-            pass
-
-
-    else:
-        # Classic streamlit-drawable-canvas flow (supports polygons + bulk add)
-        drawing_mode = "rect" if tool == "Rectangle" else "polygon"
-        canvas_key = st.session_state.get("draw_canvas_key", "draw_canvas")
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,0.0)",
-            stroke_width=2,
-            stroke_color="#1f77b4",
-            background_color="#fafafa",
-            height=int(canvas_h),
-            width=int(canvas_w),
-            drawing_mode=drawing_mode,
-            display_toolbar=True,
-            update_streamlit=True,
-            key=canvas_key
-        )
-        if canvas_result and canvas_result.json_data:
-            objs = canvas_result.json_data.get("objects", [])
-            if objs:
-                last_obj = objs[-1]
-                if drawing_mode == "rect" and last_obj.get("type") == "rect":
-                    w_px, h_px = _fabric_rect_dims(last_obj)
-                    live_w = round(w_px / px_per_unit, precision)
-                    live_h = round(h_px / px_per_unit, precision)
-                elif drawing_mode != "rect" and last_obj.get("path"):
-                    pts = _fabric_polygon_points(last_obj)
-                    if len(pts) >= 3:
-                        bw, bh = _bbox_of_polygon(pts)
-                        live_w = round(bw / px_per_unit, precision)
-                        live_h = round(bh / px_per_unit, precision)
-
-        col_live = st.columns(2)
-        with col_live[0]:
-            st.metric("Live width", f"{live_w if live_w is not None else '—'} {_pretty_units(units)}")
-        with col_live[1]:
-            st.metric("Live height", f"{live_h if live_h is not None else '—'} {_pretty_units(units)}")
-
-        # Bulk actions for drawn shapes (classic only)
-        bulk_cols = st.columns([1,1,1])
-        with bulk_cols[0]:
-            if st.button("➕ Add all drawn shapes", type="secondary"):
-                added = 0
-                if canvas_result and canvas_result.json_data:
-                    objs = canvas_result.json_data.get("objects", [])
-                    for obj in objs:
-                        if obj.get("type") == "rect":
-                            w_px, h_px = _fabric_rect_dims(obj)
-                            w = round(w_px / px_per_unit, precision)
-                            h = round(h_px / px_per_unit, precision)
-                            if w > 0 and h > 0:
-                                st.session_state.parts.append(Part(
-                                    id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
-                                    qty=1, shape_type="rect", width=float(w), height=float(h),
-                                    points=None, allow_rotation=True
-                                ))
-                                added += 1
-                        elif obj.get("path"):
-                            pts = _fabric_polygon_points(obj)
-                            if len(pts) >= 3:
-                                pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
-                                st.session_state.parts.append(Part(
-                                    id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
-                                    qty=1, shape_type="polygon", width=None, height=None,
-                                    points=pts_units, allow_rotation=True
-                                ))
-                                added += 1
-                if added:
-                    st.session_state.needs_nest = True
-                    st.success(f"Added {added} shape(s) from the drawing layer.")
-        with bulk_cols[1]:
-            if st.button("🧹 Clear drawing layer"):
-                st.session_state["draw_canvas_key"] = uuid.uuid4().hex
-                st.rerun()
-        with bulk_cols[2]:
-            st.caption("Tip: draw multiple shapes first, then **Add all**.")
-
-    # Parametric L-shape (unchanged)
-    l_poly_units = None; A=B=tA=tB=angle=None
-    if tool == "L-shape (parametric)":
-        st.write("Define outer legs A & B, depth D (tA=tB), and angle (defaults 90°).")
-        colA, colB = st.columns(2)
-        with colA:
-            A = st.number_input(f"Outer leg A length ({_pretty_units(units)})", min_value=1.0, value=120.0, step=0.5, format="%.2f")
-            tA = st.number_input(f"Depth / thickness D ({_pretty_units(units)})", min_value=0.1, value=25.0, step=0.1, format="%.2f")
-        with colB:
-            B = st.number_input(f"Outer leg B length ({_pretty_units(units)})", min_value=1.0, value=60.0, step=0.5, format="%.2f")
-            tB = tA  # equal depths
-        angle = st.number_input("Inside angle (degrees)", min_value=30.0, max_value=150.0, value=90.0, step=1.0, format="%.0f")
-
-        def make_L_polygon(A, D, B, angle_deg) -> List[Tuple[float, float]]:
-            pts = [(0,0),(A,0),(A,D),(D,D),(D,B),(0,B),(0,0)]
-            if abs(angle_deg - 90.0) > 1e-6:
-                theta = math.radians(90.0 - angle_deg)
-                rot = lambda p: (p[0]*math.cos(theta)-p[1]*math.sin(theta), p[0]*math.sin(theta)+p[1]*math.cos(theta))
-                pts = [rot(p) for p in pts]
-            return pts
-
-        l_poly_units = make_L_polygon(float(A), float(tA), float(B), float(angle))
-        prev = go.Figure()
-        x = [p[0] for p in l_poly_units]; y = [p[1] for p in l_poly_units]
-        prev.add_trace(go.Scatter(x=x+[x[0]], y=y+[y[0]], mode="lines+markers", name="L"))
-        prev.update_yaxes(scaleanchor="x", scaleratio=1)
-        prev.update_layout(title="L preview", width=480, height=360, margin=dict(l=20,r=20,t=40,b=20))
-        st.plotly_chart(prev, use_container_width=True)
-
-    # Add current shape (expander) — supports cutouts for rects/Ls in classic path
-    with st.expander("Add the current shape to the Parts list (classic tools)", expanded=(tool!="Rectangle" or not use_live_drawer)):
-        default_qty = st.number_input("Quantity", min_value=1, step=1, value=1, key="exp_qty")
-        default_label = st.text_input("Label (optional)", value="", key="exp_label")
-        allow_rot = st.checkbox("Allow rotation for this part (0/90°)", value=True, key="exp_rot")
-
-        st.markdown("**Optional: rectangular cutouts (sinks, cooktops)**")
-        add_cut = st.checkbox("Add cutout(s) to this part", key="exp_cut_toggle")
-        cut_list: List[Tuple[float,float,float,float]] = []
-        if add_cut:
-            ncuts = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1, key="exp_cut_count")
-            for i in range(ncuts):
-                st.write(f"Cutout #{i+1}")
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f", key=f"exp_cw_{i}")
-                with c2:
-                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f", key=f"exp_ch_{i}")
-                with c3:
-                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"exp_cx_{i}")
-                with c4:
-                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"exp_cy_{i}")
-                cut_list.append((cx, cy, cw, ch))
-
-        if st.button("➕ Add this shape", type="secondary", key="exp_add_btn"):
-            if tool == "Rectangle" and not use_live_drawer:
-                if not last_obj or last_obj.get("type") != "rect":
-                    st.warning("Draw a rectangle first.")
-                else:
-                    w_px, h_px = _fabric_rect_dims(last_obj)
-                    w = round(w_px / px_per_unit, precision); h = round(h_px / px_per_unit, precision)
-                    if w <= 0 or h <= 0:
-                        st.error("This rectangle has zero width/height.")
-                    else:
-                        if add_cut and cut_list:
-                            outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
-                            poly = polygon_with_cutouts(outer, cut_list)
-                            st.session_state.parts.append(Part(
-                                id=str(uuid.uuid4()), label=default_label or f"Rect-{len(st.session_state.parts)+1}",
-                                qty=int(default_qty), shape_type="polygon",
-                                width=None, height=None, points=list(poly.exterior.coords),
-                                allow_rotation=bool(allow_rot),
-                                meta={"cutouts": cut_list}
-                            ))
-                            st.success(f"Added rectangle (with {len(cut_list)} cutout(s))")
-                        else:
-                            st.session_state.parts.append(Part(
-                                id=str(uuid.uuid4()), label=default_label or f"Rect-{len(st.session_state.parts)+1}",
-                                qty=int(default_qty), shape_type="rect",
-                                width=float(w), height=float(h), points=None,
-                                allow_rotation=bool(allow_rot)
-                            ))
-                            st.success(f"Added rectangle ({w} × {h} {_pretty_units(units)})")
-                        st.session_state.needs_nest = True
-
-            elif tool == "Polygon (freehand)":
-                if not last_obj or not last_obj.get("path"):
-                    st.warning("Draw a polygon first.")
-                else:
-                    pts = _fabric_polygon_points(last_obj)
-                    if len(pts) < 3:
-                        st.error("Polygon needs at least 3 points.")
-                    else:
-                        pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
-                        st.session_state.parts.append(Part(
-                            id=str(uuid.uuid4()), label=default_label or f"Poly-{len(st.session_state.parts)+1}",
-                            qty=int(default_qty), shape_type="polygon",
-                            width=None, height=None, points=pts_units,
-                            allow_rotation=bool(allow_rot)
-                        ))
-                        st.session_state.needs_nest = True
-                        st.success("Added polygon.")
-
-            elif tool == "L-shape (parametric)":
-                if not l_poly_units or len(l_poly_units) < 3:
-                    st.error("L-shape parameters invalid.")
-                else:
-                    meta = {"is_L": True, "A": float(A), "B": float(B), "tA": float(tA), "tB": float(tB), "angle": float(angle)}
-                    if add_cut and cut_list:
-                        poly = polygon_with_cutouts(l_poly_units, cut_list)
-                        meta["cutouts"] = cut_list
-                        pts_out = list(poly.exterior.coords)
-                    else:
-                        pts_out = l_poly_units
-                    st.session_state.parts.append(Part(
-                        id=str(uuid.uuid4()), label=default_label or f"L-{len(st.session_state.parts)+1}",
-                        qty=int(default_qty), shape_type="polygon",
-                        width=None, height=None, points=pts_out,
-                        allow_rotation=bool(allow_rot),
-                        meta=meta
-                    ))
-                    st.session_state.needs_nest = True
-                    if add_cut and cut_list:
-                        st.success("Added L-shape (with cutout(s)).")
-                    else:
-                        st.success("Added L-shape.")
-
-    # Parts editor
-    st.markdown("---")
-    st.subheader("Parts")
-    if not st.session_state.parts:
-        st.info("No parts yet. Add a shape above.")
-    else:
-        rows = []
-        for p in st.session_state.parts:
-            rows.append({
-                "id": p.id, "Label": p.label,
-                "Type": ("L" if p.meta.get("is_L") else p.shape_type),
-                "Width": round(p.width, precision) if p.width is not None else None,
-                "Height": round(p.height, precision) if p.height is not None else None,
-                "Qty": p.qty,
-                "Allow Rotation": p.allow_rotation,
+def commit_pending_to_parts():
+    """
+    Normalize all pending shapes into rows for the parts table.
+    - Rect: one row
+    - L-shape: split to two rect rows with a note
+    - Poly: store as polygon row with area
+    """
+    for item in st.session_state.pending:
+        t = item["type"]
+        d = item["data"]
+        if t == "rect":
+            area = d["w"] * d["h"]
+            st.session_state.parts.append({
+                "ID": d["shape_id"],
+                "Type": "Rect",
+                "Label": d["label"],
+                "W (in)": d["w"],
+                "H (in)": d["h"],
+                "Qty": d["qty"],
+                "Area (in²)": round(area, 2),
+                "Note": d.get("note",""),
+                "Cutouts": d.get("cutouts", [])
             })
-        df = pd.DataFrame(rows)
-        edited = st.data_editor(df.drop(columns=["id"]), use_container_width=True, num_rows="fixed", key="parts_editor")
-        if len(edited) == len(st.session_state.parts):
-            for i, p in enumerate(st.session_state.parts):
-                row = edited.iloc[i]
-                p.label = str(row["Label"]); p.allow_rotation = bool(row["Allow Rotation"]); p.qty = int(row["Qty"])
-                if p.shape_type == "rect":
-                    w = float(row["Width"]) if row["Width"] is not None else p.width
-                    h = float(row["Height"]) if row["Height"] is not None else p.height
-                    if (p.width != w) or (p.height != h):
-                        p.width = max(0.0, w or 0.0); p.height = max(0.0, h or 0.0)
-                        st.session_state.needs_nest = True
+        elif t == "lshape":
+            rects = split_lshape_into_rects(d["outer_w"], d["outer_h"], d["notch_w"], d["notch_h"])
+            # Add each rectangle as a separate row with same ID but suffixed
+            for idx, (w, h) in enumerate(rects, start=1):
+                area = w*h
+                st.session_state.parts.append({
+                    "ID": f'{d["shape_id"]}-{idx}',
+                    "Type": "Rect (from L)",
+                    "Label": d["label"],
+                    "W (in)": w,
+                    "H (in)": h,
+                    "Qty": d["qty"],
+                    "Area (in²)": round(area, 2),
+                    "Note": f'L-split: outer {d["outer_w"]}x{d["outer_h"]} - notch {d["notch_w"]}x{d["notch_h"]}'
+                })
+        elif t == "poly":
+            # Approx area via polygon shoelace (in²)
+            pts = d["points"]
+            area = polygon_area(pts)
+            st.session_state.parts.append({
+                "ID": d["shape_id"],
+                "Type": "Polygon",
+                "Label": d["label"],
+                "W (in)": "-",
+                "H (in)": "-",
+                "Qty": d["qty"],
+                "Area (in²)": round(area, 2),
+                "Note": d.get("note",""),
+                "Points": pts
+            })
+    st.session_state.pending = []
+
+def polygon_area(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    s = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i+1) % len(points)]
+        s += x1*y2 - x2*y1
+    return abs(s)/2.0
+
+def add_cutout_to_parent(parent_id: str, cutout: Cutout):
+    """
+    Adds a cutout to a pending RECT shape (by its shape_id).
+    """
+    for item in st.session_state.pending:
+        if item["type"] == "rect" and item["data"]["shape_id"] == parent_id:
+            if item["data"].get("cutouts") is None:
+                item["data"]["cutouts"] = []
+            item["data"]["cutouts"].append(asdict(cutout))
+            return True
+    return False
+
+# -------------------------- Sidebar Controls --------------------------
+with st.sidebar:
+    st.header("Global Settings")
+    st.caption("Units assumed: inches. Adjust canvas scale (pixels-per-inch) for dimension accuracy.")
+    st.session_state.ppi = st.slider("Canvas scale (pixels per inch)", min_value=4.0, max_value=20.0, value=st.session_state.ppi, step=0.5)
+    canvas_w = st.slider("Canvas width (px)", 800, 1800, 1200, 50)
+    canvas_h = st.slider("Canvas height (px)", 500, 1200, 700, 25)
+
+    st.divider()
+    st.subheader("Slab / Nesting (preview)")
+    slab_w = st.number_input("Slab width (in)", min_value=20.0, value=126.0, step=1.0)
+    slab_h = st.number_input("Slab height (in)", min_value=20.0, value=63.0, step=1.0)
+    kerf = st.number_input("Kerf / spacing (in)", min_value=0.0, value=0.25, step=0.05)
+    edge_margin = st.number_input("Edge margin (in)", min_value=0.0, value=1.0, step=0.25)
+
+# -------------------------- Layout --------------------------
+left, mid, right = st.columns([1.2, 1.1, 1])
+
+with left:
+    st.subheader("Draw Shapes")
+    st.caption("Use the toolbar to draw rectangles or points for polygons. Live rectangle W×H appears below while dragging.")
+    # Canvas
+    canvas_result = st_canvas(
+        fill_color="rgba(0, 151, 255, 0.2)",
+        stroke_width=2,
+        stroke_color="#0097FF",
+        background_color="#ffffff",
+        update_streamlit=True,              # Important: updates each drag
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode="rect",                # default; user can switch via UI below
+        key=f"canvas_{st.session_state.canvas_key_bump}"
+    )
+
+    # Controls for drawing mode
+    drawing_mode = st.radio(
+        "Drawing mode",
+        options=["Rectangle", "Polygon (click points)", "Transform/Select"],
+        horizontal=True
+    )
+
+    # If user changes mode, bump canvas key to force proper internal mode reset
+    desired = {"Rectangle": "rect", "Polygon (click points)": "point", "Transform/Select": "transform"}[drawing_mode]
+    # No direct prop to set mode dynamically via st_canvas API outside rerender; we force rerender only when switching.
+    # This is a light workaround—clicking the radio will refresh the app anyway.
+
+    # Live rectangle dimensions while dragging
+    live_text_placeholder = st.empty()
+    if canvas_result.json_data is not None and "objects" in canvas_result.json_data:
+        objs = canvas_result.json_data["objects"]
+        # Find the most recently added rectangle-like object and show its live dimensions
+        if len(objs) > 0:
+            last = objs[-1]
+            # Fabric.js rectangle has "width" & "height" in px (scaled by "scaleX"/"scaleY")
+            if last.get("type") == "rect":
+                w_px = float(last.get("width", 0)) * float(last.get("scaleX", 1))
+                h_px = float(last.get("height", 0)) * float(last.get("scaleY", 1))
+                w_in = px_to_in(w_px, st.session_state.ppi)
+                h_in = px_to_in(h_px, st.session_state.ppi)
+                st.session_state.last_drawn_dims = (w_in, h_in)
+                live_text_placeholder.info(f"Live rectangle size: **{w_in:.2f} in × {h_in:.2f} in**")
+            elif last.get("type") == "circle":
+                r_px = float(last.get("radius", 0)) * float(last.get("scaleX", 1))
+                d_in = px_to_in(2*r_px, st.session_state.ppi)
+                live_text_placeholder.info(f"Live circle diameter: **{d_in:.2f} in**")
+            elif last.get("type") in ("polygon", "polyline", "path"):
+                live_text_placeholder.info("Live polygon: points updating...")
+    else:
+        live_text_placeholder.empty()
+
+    st.markdown("—")
+    st.caption("**Tip:** After drawing a rectangle, use the ‘Add this shape’ panel to capture dimensions and queue it.")
+
+    # Add-from-canvas helpers
+    with st.expander("Add this shape (from last drawn rectangle)", expanded=True):
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            rect_label = st.text_input("Label", value="Countertop Part")
+        with colB:
+            rect_qty = st.number_input("Qty", min_value=1, value=1, step=1)
+        with colC:
+            rect_note = st.text_input("Note", value="")
+
+        # Auto-read the last rectangle dims if present
+        auto_dims = st.session_state.last_drawn_dims or (0.0, 0.0)
+        col1, col2 = st.columns(2)
+        with col1:
+            w_in = st.number_input("Width (in)", min_value=0.0, value=float(auto_dims[0]), step=0.25, format="%.3f")
+        with col2:
+            h_in = st.number_input("Height (in)", min_value=0.0, value=float(auto_dims[1]), step=0.25, format="%.3f")
+
+        if st.button("➕ Add this rectangle to pending", type="primary"):
+            if w_in > 0 and h_in > 0:
+                add_rect_to_pending(rect_label.strip() or "Countertop Part", w_in, h_in, rect_qty, rect_note)
+                st.success(f"Added {w_in:.2f}×{h_in:.2f} (Qty {rect_qty}) to pending.")
+            else:
+                st.warning("Width and Height must be > 0.")
+
+    with st.expander("Add Polygon (click points on canvas, then capture)", expanded=False):
+        pcol1, pcol2 = st.columns([2,1])
+        with pcol1:
+            poly_label = st.text_input("Polygon label", value="Polygon Part")
+        with pcol2:
+            poly_qty = st.number_input("Polygon qty", min_value=1, value=1, step=1)
+        if st.button("Capture polygon from canvas objects"):
+            pts_in = extract_polygon_points_in_inches(canvas_result, st.session_state.ppi)
+            if len(pts_in) >= 3:
+                add_poly_to_pending(poly_label.strip() or "Polygon Part", pts_in, poly_qty)
+                st.success(f"Captured polygon with {len(pts_in)} points.")
+            else:
+                st.warning("Draw a polygon (as series of points/shape) before capturing.")
+
+with mid:
+    st.subheader("Shape Wizards")
+    with st.expander("L-Shape (default 90° split at inside corner)", expanded=True):
+        l1, l2 = st.columns(2)
+        with l1:
+            l_label = st.text_input("L label", value="L-Shape")
+            l_outer_w = st.number_input("Outer width (in)", min_value=0.0, value=80.0, step=0.5)
+            l_outer_h = st.number_input("Outer height (in)", min_value=0.0, value=26.0, step=0.5)
+        with l2:
+            l_notch_w = st.number_input("Notch width (in)", min_value=0.0, value=24.0, step=0.5)
+            l_notch_h = st.number_input("Notch height (in)", min_value=0.0, value=18.0, step=0.5)
+            l_qty = st.number_input("Qty", min_value=1, value=1, step=1)
+        if st.button("➕ Add L-Shape to pending"):
+            # sanity: notch must fit in outer dims
+            if l_notch_w < l_outer_w and l_notch_h < l_outer_h:
+                add_lshape_to_pending(l_label.strip() or "L-Shape", l_outer_w, l_outer_h, l_notch_w, l_notch_h, l_qty)
+                st.success("L-Shape queued (will auto-split to two rectangles on commit).")
+            else:
+                st.error("Notch must be smaller than outer dimensions.")
+
+    with st.expander("Cutouts (sink / cooktop) for a pending rectangle", expanded=True):
+        pending_rects = [(p["data"]["shape_id"], f'{p["data"]["shape_id"]} – {p["data"]["label"]} {p["data"]["w"]}x{p["data"]["h"]}')
+                         for p in st.session_state.pending if p["type"] == "rect"]
+        if len(pending_rects) == 0:
+            st.caption("No pending rectangles yet. Add a rectangle first.")
+        else:
+            pid, display = None, None
+            selection = st.selectbox("Select parent rectangle", options=[x[1] for x in pending_rects])
+            # map back to id
+            for sid, disp in pending_rects:
+                if disp == selection:
+                    pid = sid
+                    display = disp
+                    break
+            c1, c2 = st.columns(2)
+            with c1:
+                cut_kind = st.selectbox("Cutout type", options=["sink", "cooktop", "other"], index=0)
+                cut_w = st.number_input("Cutout width (in)", min_value=0.0, value=33.0, step=0.25)
+                cut_h = st.number_input("Cutout height (in)", min_value=0.0, value=22.0, step=0.25)
+            with c2:
+                cut_x = st.number_input("Offset X from parent left (in)", min_value=0.0, value=10.0, step=0.25)
+                cut_y = st.number_input("Offset Y from parent top (in)", min_value=0.0, value=10.0, step=0.25)
+
+            if st.button("➕ Add cutout to selected parent"):
+                ok = add_cutout_to_parent(pid, Cutout(cut_kind, cut_x, cut_y, cut_w, cut_h))
+                if ok:
+                    st.success(f"Cutout added to {display}")
+                else:
+                    st.error("Could not add cutout. Make sure a pending rectangle is selected.")
+
+    st.markdown("---")
+    colq1, colq2 = st.columns([1,1])
+    with colq1:
+        if st.button("✅ Add ALL pending to parts list (commit)", type="primary"):
+            if len(st.session_state.pending) == 0:
+                st.info("Nothing pending to add.")
+            else:
+                commit_pending_to_parts()
+                st.success("Pending shapes committed to parts list.")
+    with colq2:
+        if st.button("🗑️ Clear pending (not committed)"):
+            st.session_state.pending = []
+            st.info("Pending cleared.")
+
+    # Show pending preview
+    if len(st.session_state.pending) > 0:
+        st.caption("Pending (not yet added):")
+        st.dataframe(pd.DataFrame([
+            {
+                "Type": p["type"],
+                "Label": p["data"].get("label") or p["data"].get("Label"),
+                "Dims/Points": (
+                    f'{p["data"].get("w","-")}×{p["data"].get("h","-")}'
+                    if p["type"] == "rect" else
+                    f'L: {p["data"]["outer_w"]}×{p["data"]["outer_h"]} (notch {p["data"]["notch_w"]}×{p["data"]["notch_h"]})'
+                    if p["type"] == "lshape" else
+                    f'{len(p["data"]["points"])} pts'
+                ),
+                "Qty": p["data"].get("qty", 1),
+                "Note": p["data"].get("note","")
+            } for p in st.session_state.pending
+        ]), use_container_width=True)
 
 with right:
-    st.subheader("Nesting")
-
-    # ───────────────────────── Split helpers ─────────────────────────
-    def split_rect_if_needed(p: Part, sheet_w: float, sheet_h: float,
-                             min_leg: float, seam_gap: float, prefer_long: bool, clearance: float) -> tuple[list[Part], bool]:
-        """Split an oversized rectangle into panels that fit; returns (subs, did_split)."""
-        if p.shape_type != "rect" or p.width is None or p.height is None:
-            return [p], False
-        W, H = p.width, p.height
-        usable_w = max(0.0, sheet_w - clearance)
-        usable_h = max(0.0, sheet_h - clearance)
-        if W <= usable_w and H <= usable_h:
-            return [p], False
-
-        parts_out: List[Part] = []
-        long_side = "W" if W >= H else "H"
-        split_along_width = (long_side == "W") if prefer_long else (long_side == "H")
-        if W > usable_w and H <= usable_h: split_along_width = True
-        if H > usable_h and W <= usable_w: split_along_width = False
-
-        if split_along_width:
-            remaining = W; idx = 1
-            while remaining > 1e-9:
-                panel = min(usable_w, remaining)
-                if panel < min_leg - 1e-9:
-                    if parts_out:
-                        prev = parts_out.pop()
-                        merged = prev.width + seam_gap + panel
-                        if merged > usable_w + 1e-9:
-                            st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
-                            return [p], False
-                        parts_out.append(Part(id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}", qty=p.qty,
-                                              shape_type="rect", width=merged, height=H, points=None,
-                                              allow_rotation=p.allow_rotation, meta={"from": p.id}))
-                    else:
-                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                        return [p], False
-                else:
-                    parts_out.append(Part(id=str(uuid.uuid4()), label=f"{p.label}-S{idx}", qty=p.qty,
-                                          shape_type="rect", width=panel, height=H, points=None,
-                                          allow_rotation=p.allow_rotation, meta={"from": p.id}))
-                remaining -= panel
-                if remaining > 1e-9: remaining -= seam_gap
-                idx += 1
-        else:
-            remaining = H; idx = 1
-            while remaining > 1e-9:
-                panel = min(usable_h, remaining)
-                if panel < min_leg - 1e-9:
-                    if parts_out:
-                        prev = parts_out.pop()
-                        merged = prev.height + seam_gap + panel
-                        if merged > usable_h + 1e-9:
-                            st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
-                            return [p], False
-                        parts_out.append(Part(id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}", qty=p.qty,
-                                              shape_type="rect", width=W, height=merged, points=None,
-                                              allow_rotation=p.allow_rotation, meta={"from": p.id}))
-                    else:
-                        st.session_state.messages.append(f"⚠️ Cannot split {p.label}: min leg violated.")
-                        return [p], False
-                else:
-                    parts_out.append(Part(id=str(uuid.uuid4()), label=f"{p.label}-S{idx}", qty=p.qty,
-                                          shape_type="rect", width=W, height=panel, points=None,
-                                          allow_rotation=p.allow_rotation, meta={"from": p.id}))
-                remaining -= panel
-                if remaining > 1e-9: remaining -= seam_gap
-                idx += 1
-
-        return (parts_out if parts_out else [p]), (len(parts_out) > 1)
-
-    def decompose_L_prefer_corner(p: Part) -> list[Part]:
-        """Default corner split: Rect1=(A-D)×D, Rect2=B×D."""
-        m = p.meta or {}
-        if not m.get("is_L"): return [p]
-        if abs(float(m.get("angle", 90.0)) - 90.0) > 1e-6: return [p]
-        A = float(m.get("A", 0.0)); B = float(m.get("B", 0.0)); D = float(m.get("tA", 0.0))
-        r1 = Part(id=str(uuid.uuid4()), label=f"{p.label}-legA", qty=p.qty, shape_type="rect",
-                  width=max(0.0, A - D), height=D, points=None, allow_rotation=p.allow_rotation, meta={"from_L": p.id, "leg":"A"})
-        r2 = Part(id=str(uuid.uuid4()), label=f"{p.label}-legB", qty=p.qty, shape_type="rect",
-                  width=D, height=B, points=None, allow_rotation=p.allow_rotation, meta={"from_L": p.id, "leg":"B"})
-        if r1.width <= 0 or r1.height <= 0 or r2.width <= 0 or r2.height <= 0:
-            return [p]
-        return [r1, r2]
-
-    def decompose_L_alternate(p: Part) -> list[Part]:
-        """Alternate: Rect1=A×D, Rect2=(B−D)×D."""
-        m = p.meta or {}
-        if not m.get("is_L"): return [p]
-        if abs(float(m.get("angle", 90.0)) - 90.0) > 1e-6: return [p]
-        A = float(m.get("A", 0.0)); B = float(m.get("B", 0.0)); D = float(m.get("tA", 0.0))
-        r1 = Part(id=str(uuid.uuid4()), label=f"{p.label}-legA", qty=p.qty, shape_type="rect",
-                  width=A, height=D, points=None, allow_rotation=p.allow_rotation, meta={"from_L": p.id, "leg":"A"})
-        r2 = Part(id=str(uuid.uuid4()), label=f"{p.label}-legB", qty=p.qty, shape_type="rect",
-                  width=max(0.0, B - D), height=D, points=None, allow_rotation=p.allow_rotation, meta={"from_L": p.id, "leg":"B"})
-        if r1.width <= 0 or r1.height <= 0 or r2.width <= 0 or r2.height <= 0:
-            return [p]
-        return [r1, r2]
-
-    # ───────────────────────── Nesting engines ─────────────────────────
-    def rectpack_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool):
-        """Fast rectangle nesting; polygons use bounding boxes."""
-        to_add = []
-        expanded: List[Part] = []
-        any_split = False
-
-        for p in parts:
-            if p.qty <= 0: continue
-            subs = [p]
-            did_split = False
-
-            # L split policy
-            if p.meta.get("is_L") and enable_L_seams and abs(p.meta.get("angle", 90.0) - 90.0) < 1e-6:
-                A = float(p.meta.get("A", 0.0)); B = float(p.meta.get("B", 0.0)); D = float(p.meta.get("tA", 0.0))
-                fits_sheet = (A <= sheet_w and B <= sheet_h)
-                if not (A <= L_max_leg_no_split and B <= L_max_leg_no_split and fits_sheet):
-                    cand1 = decompose_L_prefer_corner(p)
-                    cand2 = decompose_L_alternate(p)
-                    s1, _ = _rectpack_trial(cand1, sheet_w, sheet_h, clearance, rotation)
-                    s2, _ = _rectpack_trial(cand2, sheet_w, sheet_h, clearance, rotation)
-                    subs = cand1 if len(s1) <= len(s2) else cand2
-                    did_split = True
-
-            # Rectangle auto-split
-            if autosplit_rects:
-                next_subs = []
-                for s in subs:
-                    if s.shape_type == "rect":
-                        ss, did = split_rect_if_needed(s, sheet_w, sheet_h, min_leg, seam_gap, prefer_long_split == "long side", clearance)
-                        did_split = did_split or did
-                        next_subs.extend(ss)
-                    else:
-                        next_subs.append(s)
-                subs = next_subs
-
-            any_split = any_split or did_split
-            for s in subs:
-                for _ in range(p.qty):
-                    expanded.append(s)
-
-        rotation_effective = rotation and (not any_split)
-        packer = newPacker(rotation=rotation_effective)
-        EPS = 1e-6
-
-        for s in expanded:
-            if s.shape_type == "rect" and s.width and s.height:
-                w = min(s.width + clearance, sheet_w - EPS)
-                h = min(s.height + clearance, sheet_h - EPS)
-            else:
-                if s.points:
-                    poly = Polygon(s.points); minx, miny, maxx, maxy = poly.bounds
-                    w = min((maxx - minx) + clearance, sheet_w - EPS)
-                    h = min((maxy - miny) + clearance, sheet_h - EPS)
-                else:
-                    continue
-            rid = f"{s.label}#{uuid.uuid4().hex[:4]}"
-            to_add.append((w, h, rid, s.label))
-
-        if not to_add:
-            return [], 0.0
-
-        for (w, h, rid, _) in to_add: packer.add_rect(w, h, rid=rid)
-        for _ in range(200): packer.add_bin(sheet_w, sheet_h)
-        packer.pack()
-
-        sheets = []
-        total_area = 0.0
-        for abin in packer:
-            rects = abin.rect_list()
-            if not rects: continue
-            placements = []
-            for (x, y, w, h, rid) in rects:
-                label = rid.split("#")[0]
-                placements.append({"x": x, "y": y, "w": w - clearance, "h": h - clearance, "rid": rid, "label": label})
-                total_area += max(0.0, (w - clearance)) * max(0.0, (h - clearance))
-            sheets.append({"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": placements})
-
-        util = total_area / max(1e-9, len(sheets)*sheet_w*sheet_h)
-        return sheets, util
-
-    def _rectpack_trial(parts_trial, sheet_w, sheet_h, clearance, rotation):
-        """Tiny helper: run rectpack quickly to compare splits."""
-        packer = newPacker(rotation=rotation)
-        EPS = 1e-6
-        for s in parts_trial:
-            w = min((s.width or 0) + clearance, sheet_w - EPS)
-            h = min((s.height or 0) + clearance, sheet_h - EPS)
-            packer.add_rect(w, h, rid=str(uuid.uuid4()))
-        for _ in range(50): packer.add_bin(sheet_w, sheet_h)
-        packer.pack()
-        return [abin for abin in packer if abin.rect_list()], None
-
-    def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: float, rotation: bool, grid_step: float = 0.5):
-        """
-        Polygon-aware greedy placer (0/90°):
-          - Part → Shapely polygon (rects true rects; polygons true outlines; cutouts as holes).
-          - Scan a grid (grid_step) L-to-R, T-to-B.
-          - Place if within sheet and no collisions (clearance/2 buffered).
-          - Starts a new sheet when no position fits.
-        """
-        expanded: List[Tuple[Part, Polygon]] = []
-        any_split = False
-
-        def part_to_poly(s: Part) -> Polygon | None:
-            if s.shape_type == "rect" and s.width and s.height:
-                outer = shp_box(0, 0, s.width, s.height)
-                if s.meta.get("cutouts"):
-                    diff = outer
-                    for (cx,cy,cw,ch) in s.meta["cutouts"]:
-                        diff = diff.difference(shp_box(cx, cy, cx+cw, cy+ch))
-                    return diff
-                return outer
-            if s.shape_type == "polygon" and s.points:
-                try:
-                    poly = Polygon(s.points)
-                    if s.meta.get("cutouts"):
-                        for (cx,cy,cw,ch) in s.meta["cutouts"]:
-                            poly = poly.difference(shp_box(cx, cy, cx+cw, cy+ch))
-                    return poly
-                except Exception:
-                    return None
-            return None
-
-        # Expand + apply L policy + rect auto-split
-        for p in parts:
-            if p.qty <= 0: continue
-            subs = [p]; did_split = False
-
-            if p.meta.get("is_L") and enable_L_seams and abs(p.meta.get("angle",90.0)-90.0) < 1e-6:
-                A = float(p.meta.get("A",0.0)); B = float(p.meta.get("B",0.0)); D = float(p.meta.get("tA",0.0))
-                L_poly = part_to_poly(p)
-                fits_sheet = False
-                if L_poly is not None:
-                    minx, miny, maxx, maxy = L_poly.bounds
-                    fits_sheet = (maxx - minx) <= sheet_w and (maxy - miny) <= sheet_h
-                if not (A <= L_max_leg_no_split and B <= L_max_leg_no_split and fits_sheet):
-                    cand1 = decompose_L_prefer_corner(p)
-                    cand2 = decompose_L_alternate(p)
-                    s1, _ = _rectpack_trial(cand1, sheet_w, sheet_h, clearance, rotation)
-                    s2, _ = _rectpack_trial(cand2, sheet_w, sheet_h, clearance, rotation)
-                    subs = cand1 if len(s1) <= len(s2) else cand2
-                    did_split = True
-
-            if autosplit_rects:
-                next_subs = []
-                for s in subs:
-                    if s.shape_type == "rect":
-                        ss, did = split_rect_if_needed(s, sheet_w, sheet_h, min_leg, seam_gap, prefer_long_split == "long side", clearance)
-                        did_split = did_split or did
-                        next_subs.extend(ss)
-                    else:
-                        next_subs.append(s)
-                subs = next_subs
-
-            any_split = any_split or did_split
-
-            for s in subs:
-                shp = part_to_poly(s)
-                if shp is None: continue
-                for _ in range(s.qty):
-                    expanded.append((s, shp))
-
-        rotation_effective = rotation and (not any_split)
-
-        placed = []  # list of dicts with polygon+meta
-        sheet_poly = shp_box(0, 0, sheet_w, sheet_h)
-        buffer_clear = clearance / 2.0 if clearance > 0 else 0.0
-
-        for s, base_poly in sorted(expanded, key=lambda t: t[1].area, reverse=True):
-            orientations = [0]
-            if rotation_effective: orientations = [0, 90]
-            placed_ok = False
-
-            for ang in orientations:
-                poly = shp_rotate(base_poly, ang, origin=(0,0), use_radians=False)
-                y = 0.0
-                while y <= sheet_h and not placed_ok:
-                    x = 0.0
-                    while x <= sheet_w and not placed_ok:
-                        test = shp_translate(poly, xoff=x, yoff=y)
-                        bounds_ok = test.buffer(buffer_clear).within(sheet_poly)
-                        if not bounds_ok:
-                            x += grid_step; continue
-                        collision = False
-                        for other in placed:
-                            if test.buffer(buffer_clear).intersects(other["poly"].buffer(buffer_clear)):
-                                collision = True; break
-                        if not collision:
-                            placed.append({"poly": test, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": ang})
-                            placed_ok = True
-                            break
-                        x += grid_step
-                    y += grid_step
-                if placed_ok: break
-
-            if not placed_ok:
-                # finalize current sheet and start new
-                yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
-                    _poly_to_rect_anno(d["poly"], d["label"], precision) for d in placed
-                ]}
-                placed = []
-                # place this part at origin on new sheet if possible (0 or 90)
-                poly0 = shp_rotate(base_poly, 0, origin=(0,0), use_radians=False)
-                if poly0.buffer(buffer_clear).within(sheet_poly):
-                    placed.append({"poly": poly0, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": 0})
-                else:
-                    poly90 = shp_rotate(base_poly, 90, origin=(0,0), use_radians=False)
-                    if rotation_effective and poly90.buffer(buffer_clear).within(sheet_poly):
-                        placed.append({"poly": poly90, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": 90})
-                    else:
-                        st.session_state.messages.append(f"⚠️ {s.label}: cannot place on empty sheet (too large).")
-        if placed:
-            yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
-                _poly_to_rect_anno(d["poly"], d["label"], precision) for d in placed
-            ]}
-
-    def _poly_to_rect_anno(poly: Polygon, label: str, precision: int):
-        """Represent placed polygon by its bbox for preview labels; keep exact dims in text."""
-        minx, miny, maxx, maxy = poly.bounds
-        w = maxx - minx; h = maxy - miny
-        return {"x": float(minx), "y": float(miny), "w": float(w), "h": float(h), "rid": f"{label}#{uuid.uuid4().hex[:4]}", "label": label,
-                "exact_w": round(w, precision), "exact_h": round(h, precision)}
-
-    # ───────────────────────── Run nesting ─────────────────────────
-    do_nest = st.button("🧩 Nest parts", type="primary", use_container_width=True)
-    if do_nest:
-        if not st.session_state.parts:
-            st.warning("Add some parts first.")
-        else:
-            st.session_state.messages = []
-            if mode == "Fast (rectpack)":
-                sheets, util = rectpack_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global)
-                st.session_state.placements, st.session_state.utilization = sheets, util
-            else:
-                sheets = list(poly_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global, grid_step=0.5))
-                placed_area = 0.0
-                for s in sheets:
-                    for p in s["placements"]:
-                        placed_area += p["w"] * p["h"]  # bbox area lower bound
-                util = placed_area / max(1e-9, len(sheets)*sheet_w*sheet_h)
-                st.session_state.placements, st.session_state.utilization = sheets, util
-            st.session_state.needs_nest = False
-            st.session_state._open_editor = False
-
-    # Messages
-    if st.session_state.messages:
-        for m in st.session_state.messages:
-            st.warning(m)
-
-    # ───────────────────────── Preview ─────────────────────────
-    if st.session_state.placements:
-        util_pct = round(st.session_state.utilization * 100, 2)
-        used_area = sum(p["w"] * p["h"] for s in st.session_state.placements for p in s["placements"])
-        total_area = max(1e-9, len(st.session_state.placements) * sheet_w * sheet_h)
-
-        st.markdown(f"**Sheets used:** {len(st.session_state.placements)}")
-        st.markdown(f"**Utilization (approx):** {util_pct}% (used {round(used_area,2)} / {round(total_area,2)} {_pretty_units(units)}²)")
-        if st.session_state.needs_nest:
-            st.info("Parts changed. Results are stale — click **Nest parts** again.")
-
-        st.markdown("---")
-        st.subheader("Sheet preview (zoom & pan)")
-        for si, sheet in enumerate(st.session_state.placements, start=1):
-            W, H = sheet["sheet_w"], sheet["sheet_h"]
-            fig = go.Figure()
-            fig.add_shape(type="rect", x0=0, y0=0, x1=W, y1=H, line=dict(width=2), fillcolor="rgba(240,240,240,0.1)")
-            for place in sheet["placements"]:
-                x, y, w, h, label = place["x"], place["y"], place["w"], place["h"], place["label"]
-                fig.add_shape(type="rect", x0=x, y0=y, x1=x+w, y1=y+h, line=dict(width=1), fillcolor="rgba(100,150,250,0.15)")
-                fig.add_annotation(x=x+w/2, y=y+h/2,
-                                   text=f"{label}<br>{round(w, precision)} × {round(h, precision)}",
-                                   showarrow=False, font=dict(size=12))
-            fig.update_yaxes(scaleanchor="x", scaleratio=1)
-            fig.update_layout(
-                title=f"Sheet {si}", width=900, height=650, margin=dict(l=30, r=30, t=50, b=30),
-                xaxis=dict(range=[-1, W+1], title=f"Width ({_pretty_units(units)})"),
-                yaxis=dict(range=[H+1, -1], title=f"Height ({_pretty_units(units)})"),
-                dragmode="pan",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Parts List")
+    if len(st.session_state.parts) == 0:
+        st.caption("No parts yet. Add some from the left.")
     else:
-        st.info("No nesting results yet. Click **Nest parts** when you’re ready.")
+        parts_df = pd.DataFrame(st.session_state.parts)
+        st.dataframe(parts_df, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Download parts as CSV",
+            data=parts_df.to_csv(index=False),
+            file_name="parts_list.csv",
+            mime="text/csv"
+        )
+
+    st.markdown("---")
+    st.subheader("Simple Nesting Preview (greedy)")
+    st.caption("Very basic first-fit on a single slab; respects kerf and margins. For visualization only.")
+    if st.button("Run nesting preview"):
+        if len(st.session_state.parts) == 0:
+            st.info("No parts to nest.")
+        else:
+            layout = simple_nest(st.session_state.parts, slab_w, slab_h, kerf, edge_margin)
+            st.pyplot(draw_layout_matplotlib(layout, slab_w, slab_h))  # draws a quick preview
+
+# -------------------------- Canvas Utilities --------------------------
+def extract_polygon_points_in_inches(canvas_result, ppi: float) -> List[Tuple[float, float]]:
+    """
+    Try to pull a polygon-like set of points from canvas objects.
+    Supports:
+    - A 'polygon' object with .points
+    - A series of 'circle' points (user placed)
+    Falls back to empty list if not found.
+    """
+    out: List[Tuple[float, float]] = []
+    jd = canvas_result.json_data
+    if not jd or "objects" not in jd:
+        return out
+    objs = jd["objects"]
+    # Try explicit polygon
+    for obj in objs:
+        if obj.get("type") == "polygon":
+            pts = obj.get("points") or []
+            for p in pts:
+                x_in = px_to_in(float(p.get("x", 0)), ppi)
+                y_in = px_to_in(float(p.get("y", 0)), ppi)
+                out.append((x_in, y_in))
+            if len(out) >= 3:
+                return out
+    # Fallback: points from circles (click points)
+    pts_tmp = []
+    for obj in objs:
+        if obj.get("type") == "circle":
+            cx = float(obj.get("left", 0)) + float(obj.get("radius", 0)) * float(obj.get("scaleX", 1))
+            cy = float(obj.get("top", 0))  + float(obj.get("radius", 0)) * float(obj.get("scaleY", 1))
+            pts_tmp.append((px_to_in(cx, ppi), px_to_in(cy, ppi)))
+    if len(pts_tmp) >= 3:
+        return pts_tmp
+    return out
+
+# -------------------------- Simple Nesting (Preview) --------------------------
+def simple_nest(parts_rows: List[Dict], slab_w: float, slab_h: float, kerf: float, margin: float):
+    """
+    Very naive first-fit shelf algorithm for Rect* parts only.
+    Ignores polygons and cutouts for the preview.
+    Returns a list of placed rectangles: {x,y,w,h,label}
+    """
+    # Build a flat list of rectangles by Qty
+    rects = []
+    for row in parts_rows:
+        if row.get("Type","").startswith("Rect"):
+            qty = int(row.get("Qty", 1))
+            w = float(row.get("W (in)", 0))
+            h = float(row.get("H (in)", 0))
+            for _ in range(qty):
+                rects.append({"w": w, "h": h, "label": row.get("Label", "")})
+    # Sort largest-first by height, then width
+    rects.sort(key=lambda r: (max(r["w"], r["h"]), min(r["w"], r["h"])), reverse=True)
+
+    placements = []
+    cursor_x = margin
+    cursor_y = margin
+    shelf_h = 0.0
+
+    usable_w = slab_w - 2*margin
+    usable_h = slab_h - 2*margin
+
+    for r in rects:
+        w, h = r["w"], r["h"]
+        # Try w×h, else try rotated
+        placed = False
+        for (rw, rh) in [(w,h), (h,w)]:
+            if rw <= usable_w - (cursor_x - margin) and rh <= usable_h - (cursor_y - margin):
+                placements.append({"x": cursor_x, "y": cursor_y, "w": rw, "h": rh, "label": r["label"]})
+                cursor_x += rw + kerf
+                shelf_h = max(shelf_h, rh)
+                placed = True
+                break
+        if not placed:
+            # new shelf
+            cursor_x = margin
+            cursor_y += shelf_h + kerf
+            shelf_h = 0.0
+            # try again on new shelf
+            for (rw, rh) in [(w,h), (h,w)]:
+                if (cursor_y - margin + rh) <= usable_h and rw <= usable_w:
+                    placements.append({"x": cursor_x, "y": cursor_y, "w": rw, "h": rh, "label": r["label"]})
+                    cursor_x += rw + kerf
+                    shelf_h = max(shelf_h, rh)
+                    placed = True
+                    break
+        # If still not placed, it simply won't fit in this naive preview
+    return placements
+
+def draw_layout_matplotlib(placements: List[Dict], slab_w: float, slab_h: float):
+    """
+    Render the slab and placed rectangles with matplotlib (no specific colors).
+    """
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 4))
+    # slab
+    ax.add_patch(plt.Rectangle((0,0), slab_w, slab_h, fill=False, linewidth=2))
+    # parts
+    for p in placements:
+        ax.add_patch(plt.Rectangle((p["x"], p["y"]), p["w"], p["h"], fill=False))
+        ax.text(p["x"] + p["w"]/2, p["y"] + p["h"]/2, p["label"], ha='center', va='center', fontsize=8)
+    ax.set_xlim(0, slab_w)
+    ax.set_ylim(0, slab_h)
+    ax.set_aspect('equal', adjustable='box')
+    ax.invert_yaxis()  # canvas y grows downward; invert to visualize like screen
+    ax.set_xlabel("inches")
+    ax.set_ylabel("inches")
+    fig.tight_layout()
+    return fig
