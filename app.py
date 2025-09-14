@@ -1,4 +1,4 @@
-# app.py — Polygon-aware nesting + L-split policy + live dims + bulk add + cutouts
+# app.py — Polygon-aware nesting + L-split policy + live drawer + bulk add + cutouts
 from __future__ import annotations
 
 import json, math, uuid
@@ -88,6 +88,83 @@ def polygon_with_cutouts(outer_pts: List[Tuple[float,float]], cutouts: List[Tupl
         return Polygon(outer.exterior.coords, holes=[[(x,y) for (x,y) in hole] for hole in holes])
     return outer
 
+# ───────────────────────── Konva live rectangle drawer ─────────────────────────
+def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px=600):
+    """
+    Konva-based rectangle drawer with live dimension overlay.
+    Returns nothing directly; we pull JSON via a query param when user clicks the button below.
+    JSON payload: {"w":float,"h":float}
+    """
+    payload = json.dumps({"units": units_label, "ppu": ppu, "w": int(width_px), "h": int(height_px)})
+
+    html = f"""
+    <div id="konva-live-root"></div>
+    <script src="https://unpkg.com/konva@9.3.3/konva.min.js"></script>
+    <script>
+      const cfg = {payload};
+      const scale = cfg.ppu;
+
+      const container = document.createElement('div');
+      container.style.border = '1px solid #ddd';
+      container.style.width = cfg.w + 'px';
+      container.style.height = cfg.h + 'px';
+      document.getElementById('konva-live-root').appendChild(container);
+
+      const stage = new Konva.Stage({{ container: container, width: cfg.w, height: cfg.h }});
+      const layer = new Konva.Layer(); stage.add(layer);
+
+      let start = null, rect = null, label = null;
+
+      const hint = new Konva.Text({{
+        x: 8, y: 8, text: 'Drag to draw a rectangle', fontSize: 14, fill: '#333'
+      }});
+      layer.add(hint);
+
+      function fmt(v) {{ return (v/scale).toFixed(2); }}
+
+      stage.on('mousedown', () => {{
+        const pos = stage.getPointerPosition();
+        start = {{ x: pos.x, y: pos.y }};
+        if (rect) rect.destroy();
+        if (label) label.destroy();
+        rect = new Konva.Rect({{
+          x: start.x, y: start.y, width: 0, height: 0,
+          stroke: '#4074f4', strokeWidth: 1, dash: [4, 3]
+        }});
+        label = new Konva.Label({{ x: start.x + 8, y: start.y - 26 }});
+        label.add(new Konva.Tag({{ fill: 'rgba(255,255,255,0.9)', stroke: '#aaa' }}));
+        label.add(new Konva.Text({{
+          text: '', fontSize: 12, fill: '#111', padding: 4
+        }}));
+        layer.add(rect); layer.add(label);
+        layer.draw();
+      }});
+
+      stage.on('mousemove', () => {{
+        if (!start || !rect) return;
+        const pos = stage.getPointerPosition();
+        const w = pos.x - start.x;
+        const h = pos.y - start.y;
+        rect.width(w); rect.height(h);
+        const txt = label.getChildren()[1];
+        txt.text(fmt(Math.abs(w)) + ' × ' + fmt(Math.abs(h)) + ' ' + cfg.units);
+        label.position({{ x: start.x + 8, y: start.y - 26 }});
+        layer.batchDraw();
+      }});
+
+      stage.on('mouseup', () => {{
+        start = null;
+      }});
+
+      // Expose getter for Streamlit: returns latest rect dims in units.
+      window.getLiveRect = () => {{
+        if (!rect) return {{ w: 0, h: 0 }};
+        return {{ w: Math.abs(rect.width())/scale, h: Math.abs(rect.height())/scale }};
+      }};
+    </script>
+    """
+    components.html(html, height=int(height_px)+10, scrolling=False)
+
 # ───────────────────────── Sidebar ─────────────────────────
 with st.sidebar:
     st.header("Project settings")
@@ -138,11 +215,110 @@ with left:
         horizontal=False
     )
 
-    # Drawing canvas for rect/polygon
+    # Toggle: Konva live drawer for rectangles
+    use_live_drawer = False
+    if tool == "Rectangle":
+        use_live_drawer = st.toggle("Use live drawer (beta)", value=True, help="Shows W×H while dragging (Konva). Turn off to use classic canvas with bulk-add.")
+
+    # Drawing canvas (two paths: live Konva drawer for rectangles OR classic streamlit-drawable-canvas)
     last_obj = None
     live_w = live_h = None
+    canvas_result = None  # only set for classic path
 
-    if tool in ["Rectangle", "Polygon (freehand)"]:
+    if tool == "Rectangle" and use_live_drawer:
+        # Live Konva drawer
+        render_konva_rect_drawer(
+            units_label=_pretty_units(units),
+            ppu=float(px_per_unit),
+            width_px=int(canvas_w),
+            height_px=int(canvas_h)
+        )
+
+        # Inputs next to the live drawer
+        lc1, lc2, lc3 = st.columns([2,1,1])
+        with lc1:
+            live_label = st.text_input("Label (optional)", value="", key="live_rect_label")
+        with lc2:
+            live_qty = st.number_input("Qty", min_value=1, value=1, step=1, key="live_rect_qty")
+        with lc3:
+            live_allow_rot = st.checkbox("Allow rotation", value=True, key="live_rect_rot")
+
+        st.markdown("**Optional: rectangular cutouts for this rectangle**")
+        add_cut_live = st.checkbox("Add cutout(s) to this rectangle", key="live_rect_cut_toggle")
+        cut_list_live: List[Tuple[float,float,float,float]] = []
+        if add_cut_live:
+            ncuts_live = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1, key="live_rect_cut_count")
+            for i in range(ncuts_live):
+                st.write(f"Cutout #{i+1}")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f", key=f"lr_cw_{i}")
+                with c2:
+                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f", key=f"lr_ch_{i}")
+                with c3:
+                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"lr_cx_{i}")
+                with c4:
+                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"lr_cy_{i}")
+                cut_list_live.append((cx, cy, cw, ch))
+
+        # Button to pull dims from the browser and add the rectangle
+        add_live_clicked = st.button("➕ Add this rectangle", type="secondary", key="btn_add_live_rect")
+        if add_live_clicked:
+            components.html("""
+            <form method="get">
+              <input type="hidden" name="live_rect" id="lr">
+              <button type="submit" style="display:none;">submit</button>
+              <script>
+                try {
+                  const data = window.getLiveRect ? window.getLiveRect() : {w:0,h:0};
+                  document.getElementById('lr').value = JSON.stringify(data);
+                  document.forms[0].submit();
+                } catch(e) {}
+              </script>
+            </form>
+            """, height=0)
+
+        # Read result from query params
+        qp = st.query_params
+        if "live_rect" in qp and qp["live_rect"]:
+            try:
+                vals = json.loads(qp["live_rect"])
+                w = float(vals.get("w", 0.0))
+                h = float(vals.get("h", 0.0))
+                if w <= 0 or h <= 0:
+                    st.warning("Draw a rectangle first (drag on the canvas).")
+                else:
+                    if add_cut_live and cut_list_live:
+                        outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
+                        poly = polygon_with_cutouts(outer, cut_list_live)
+                        st.session_state.parts.append(Part(
+                            id=str(uuid.uuid4()),
+                            label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                            qty=int(live_qty),
+                            shape_type="polygon",
+                            width=None, height=None,
+                            points=list(poly.exterior.coords),
+                            allow_rotation=bool(live_allow_rot),
+                            meta={"cutouts": cut_list_live}
+                        ))
+                        st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
+                    else:
+                        st.session_state.parts.append(Part(
+                            id=str(uuid.uuid4()),
+                            label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                            qty=int(live_qty),
+                            shape_type="rect",
+                            width=w, height=h, points=None,
+                            allow_rotation=bool(live_allow_rot)
+                        ))
+                        st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
+                    st.session_state.needs_nest = True
+                st.query_params.clear()
+            except Exception as e:
+                st.warning(f"Could not read live rectangle: {e}")
+
+    else:
+        # Classic streamlit-drawable-canvas flow (supports polygons + bulk add)
         drawing_mode = "rect" if tool == "Rectangle" else "polygon"
         canvas_key = st.session_state.get("draw_canvas_key", "draw_canvas")
         canvas_result = st_canvas(
@@ -178,7 +354,7 @@ with left:
         with col_live[1]:
             st.metric("Live height", f"{live_h if live_h is not None else '—'} {_pretty_units(units)}")
 
-        # Bulk actions for drawn shapes
+        # Bulk actions for drawn shapes (classic only)
         bulk_cols = st.columns([1,1,1])
         with bulk_cols[0]:
             if st.button("➕ Add all drawn shapes", type="secondary"):
@@ -217,7 +393,7 @@ with left:
         with bulk_cols[2]:
             st.caption("Tip: draw multiple shapes first, then **Add all**.")
 
-    # Parametric L-shape
+    # Parametric L-shape (unchanged)
     l_poly_units = None; A=B=tA=tB=angle=None
     if tool == "L-shape (parametric)":
         st.write("Define outer legs A & B, depth D (tA=tB), and angle (defaults 90°).")
@@ -227,7 +403,7 @@ with left:
             tA = st.number_input(f"Depth / thickness D ({_pretty_units(units)})", min_value=0.1, value=25.0, step=0.1, format="%.2f")
         with colB:
             B = st.number_input(f"Outer leg B length ({_pretty_units(units)})", min_value=1.0, value=60.0, step=0.5, format="%.2f")
-            tB = tA  # equal depths for now
+            tB = tA  # equal depths
         angle = st.number_input("Inside angle (degrees)", min_value=30.0, max_value=150.0, value=90.0, step=1.0, format="%.0f")
 
         def make_L_polygon(A, D, B, angle_deg) -> List[Tuple[float, float]]:
@@ -246,32 +422,32 @@ with left:
         prev.update_layout(title="L preview", width=480, height=360, margin=dict(l=20,r=20,t=40,b=20))
         st.plotly_chart(prev, use_container_width=True)
 
-    # Add current shape (with optional cutouts)
-    with st.expander("Add the current shape to the Parts list", expanded=True):
-        default_qty = st.number_input("Quantity", min_value=1, step=1, value=1)
-        default_label = st.text_input("Label (optional)", value="")
-        allow_rot = st.checkbox("Allow rotation for this part (0/90°)", value=True)
+    # Add current shape (expander) — supports cutouts for rects/Ls in classic path
+    with st.expander("Add the current shape to the Parts list (classic tools)", expanded=(tool!="Rectangle" or not use_live_drawer)):
+        default_qty = st.number_input("Quantity", min_value=1, step=1, value=1, key="exp_qty")
+        default_label = st.text_input("Label (optional)", value="", key="exp_label")
+        allow_rot = st.checkbox("Allow rotation for this part (0/90°)", value=True, key="exp_rot")
 
         st.markdown("**Optional: rectangular cutouts (sinks, cooktops)**")
-        add_cut = st.checkbox("Add cutout(s) to this part")
+        add_cut = st.checkbox("Add cutout(s) to this part", key="exp_cut_toggle")
         cut_list: List[Tuple[float,float,float,float]] = []
         if add_cut:
-            ncuts = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1)
+            ncuts = st.number_input("Number of cutouts", min_value=1, max_value=5, value=1, step=1, key="exp_cut_count")
             for i in range(ncuts):
                 st.write(f"Cutout #{i+1}")
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f")
+                    cw = st.number_input(f"W{i+1} ({_pretty_units(units)})", min_value=0.1, value=30.0, step=0.1, format="%.2f", key=f"exp_cw_{i}")
                 with c2:
-                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f")
+                    ch = st.number_input(f"H{i+1} ({_pretty_units(units)})", min_value=0.1, value=20.0, step=0.1, format="%.2f", key=f"exp_ch_{i}")
                 with c3:
-                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f")
+                    cx = st.number_input(f"X{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"exp_cx_{i}")
                 with c4:
-                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f")
+                    cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"exp_cy_{i}")
                 cut_list.append((cx, cy, cw, ch))
 
-        if st.button("➕ Add this shape", type="secondary"):
-            if tool == "Rectangle":
+        if st.button("➕ Add this shape", type="secondary", key="exp_add_btn"):
+            if tool == "Rectangle" and not use_live_drawer:
                 if not last_obj or last_obj.get("type") != "rect":
                     st.warning("Draw a rectangle first.")
                 else:
@@ -310,7 +486,6 @@ with left:
                         st.error("Polygon needs at least 3 points.")
                     else:
                         pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
-                        # (Cutouts for freehand polygons could be supported later)
                         st.session_state.parts.append(Part(
                             id=str(uuid.uuid4()), label=default_label or f"Poly-{len(st.session_state.parts)+1}",
                             qty=int(default_qty), shape_type="polygon",
@@ -320,7 +495,7 @@ with left:
                         st.session_state.needs_nest = True
                         st.success("Added polygon.")
 
-            else:  # L-shape (parametric)
+            elif tool == "L-shape (parametric)":
                 if not l_poly_units or len(l_poly_units) < 3:
                     st.error("L-shape parameters invalid.")
                 else:
@@ -488,7 +663,6 @@ with right:
             # L split policy
             if p.meta.get("is_L") and enable_L_seams and abs(p.meta.get("angle", 90.0) - 90.0) < 1e-6:
                 A = float(p.meta.get("A", 0.0)); B = float(p.meta.get("B", 0.0)); D = float(p.meta.get("tA", 0.0))
-                # Keep intact only if both legs <= threshold AND the L fits the sheet
                 fits_sheet = (A <= sheet_w and B <= sheet_h)
                 if not (A <= L_max_leg_no_split and B <= L_max_leg_no_split and fits_sheet):
                     cand1 = decompose_L_prefer_corner(p)
