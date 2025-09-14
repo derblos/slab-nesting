@@ -265,7 +265,7 @@ with left:
         add_live_clicked = st.button("➕ Add this rectangle", type="secondary", key="btn_add_live_rect")
         if add_live_clicked:
             components.html("""
-            <form method="get">
+            <form method="get" target="_parent" action="">
               <input type="hidden" name="live_rect" id="lr">
               <button type="submit" style="display:none;">submit</button>
               <script>
@@ -276,46 +276,57 @@ with left:
                 } catch(e) {}
               </script>
             </form>
-            """, height=0)
+            """, height=0)            
 
         # Read result from query params
         qp = st.query_params
-        if "live_rect" in qp and qp["live_rect"]:
-            try:
-                vals = json.loads(qp["live_rect"])
-                w = float(vals.get("w", 0.0))
-                h = float(vals.get("h", 0.0))
-                if w <= 0 or h <= 0:
-                    st.warning("Draw a rectangle first (drag on the canvas).")
-                else:
-                    if add_cut_live and cut_list_live:
-                        outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
-                        poly = polygon_with_cutouts(outer, cut_list_live)
-                        st.session_state.parts.append(Part(
-                            id=str(uuid.uuid4()),
-                            label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                            qty=int(live_qty),
-                            shape_type="polygon",
-                            width=None, height=None,
-                            points=list(poly.exterior.coords),
-                            allow_rotation=bool(live_allow_rot),
-                            meta={"cutouts": cut_list_live}
-                        ))
-                        st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
-                    else:
-                        st.session_state.parts.append(Part(
-                            id=str(uuid.uuid4()),
-                            label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
-                            qty=int(live_qty),
-                            shape_type="rect",
-                            width=w, height=h, points=None,
-                            allow_rotation=bool(live_allow_rot)
-                        ))
-                        st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
-                    st.session_state.needs_nest = True
-                st.query_params.clear()
-            except Exception as e:
-                st.warning(f"Could not read live rectangle: {e}")
+raw = qp.get("live_rect")
+# Streamlit may return a list in some versions; normalize to string
+if isinstance(raw, list):
+    raw = raw[0] if raw else None
+if raw:
+    try:
+        vals = json.loads(raw)
+        w = float(vals.get("w", 0.0))
+        h = float(vals.get("h", 0.0))
+        if w <= 0 or h <= 0:
+            st.warning("Draw a rectangle first (drag on the canvas).")
+        else:
+            if add_cut_live and cut_list_live:
+                outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
+                poly = polygon_with_cutouts(outer, cut_list_live)
+                st.session_state.parts.append(Part(
+                    id=str(uuid.uuid4()),
+                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                    qty=int(live_qty),
+                    shape_type="polygon",
+                    width=None, height=None,
+                    points=list(poly.exterior.coords),
+                    allow_rotation=bool(live_allow_rot),
+                    meta={"cutouts": cut_list_live}
+                ))
+                st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
+            else:
+                st.session_state.parts.append(Part(
+                    id=str(uuid.uuid4()),
+                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                    qty=int(live_qty),
+                    shape_type="rect",
+                    width=w, height=h, points=None,
+                    allow_rotation=bool(live_allow_rot)
+                ))
+                st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
+            st.session_state.needs_nest = True
+    except Exception as e:
+        st.warning(f"Could not read live rectangle: {e}")
+    finally:
+        # Clear the query params so the add doesn't re-trigger on refresh
+        try:
+            st.query_params.clear()
+        except Exception:
+            # Fallback for older Streamlit versions
+            pass
+
 
     else:
         # Classic streamlit-drawable-canvas flow (supports polygons + bulk add)
