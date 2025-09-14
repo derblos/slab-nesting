@@ -263,20 +263,86 @@ with left:
 
         # Button to pull dims from the browser and add the rectangle
         add_live_clicked = st.button("➕ Add this rectangle", type="secondary", key="btn_add_live_rect")
-        if add_live_clicked:
-            components.html("""
-            <form method="get" target="_parent" action="">
-              <input type="hidden" name="live_rect" id="lr">
-              <button type="submit" style="display:none;">submit</button>
-              <script>
-                try {
-                  const data = window.getLiveRect ? window.getLiveRect() : {w:0,h:0};
-                  document.getElementById('lr').value = JSON.stringify(data);
-                  document.forms[0].submit();
-                } catch(e) {}
-              </script>
-            </form>
-            """, height=0)            
+        # Submit a tiny form inside the iframe, but target the parent page so the URL updates.
+if add_live_clicked:
+    components.html("""
+    <form method="get" target="_parent" action="">
+      <input type="hidden" name="live_rect" id="lr">
+      <button type="submit" style="display:none;">submit</button>
+      <script>
+        try {
+          const data = window.getLiveRect ? window.getLiveRect() : {w:0,h:0};
+          document.getElementById('lr').value = JSON.stringify(data);
+          document.forms[0].submit();
+        } catch(e) {}
+      </script>
+    </form>
+    """, height=0)
+
+# ---- Read & consume the query param robustly (supports older Streamlit too)
+def _get_query_params():
+    # Newer Streamlit: st.query_params (Mapping)
+    if hasattr(st, "query_params"):
+        return st.query_params
+    # Older Streamlit fallback:
+    try:
+        return st.experimental_get_query_params()
+    except Exception:
+        return {}
+
+def _clear_query_params():
+    try:
+        if hasattr(st, "query_params"):
+            st.query_params.clear()
+        else:
+            st.experimental_set_query_params()  # clears
+    except Exception:
+        pass
+
+qp = _get_query_params()
+raw = qp.get("live_rect")
+# Some versions return a list; normalize to a string
+if isinstance(raw, list):
+    raw = raw[0] if raw else None
+
+if raw:
+    try:
+        vals = json.loads(raw)
+        w = float(vals.get("w", 0.0))
+        h = float(vals.get("h", 0.0))
+        if w <= 0 or h <= 0:
+            st.warning("Draw a rectangle first (drag on the canvas).")
+        else:
+            if add_cut_live and cut_list_live:
+                outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
+                poly = polygon_with_cutouts(outer, cut_list_live)
+                st.session_state.parts.append(Part(
+                    id=str(uuid.uuid4()),
+                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                    qty=int(live_qty),
+                    shape_type="polygon",
+                    width=None, height=None,
+                    points=list(poly.exterior.coords),
+                    allow_rotation=bool(live_allow_rot),
+                    meta={"cutouts": cut_list_live}
+                ))
+                st.success(f"Added rectangle with {len(cut_list_live)} cutout(s)")
+            else:
+                st.session_state.parts.append(Part(
+                    id=str(uuid.uuid4()),
+                    label=(live_label or f"Rect-{len(st.session_state.parts)+1}"),
+                    qty=int(live_qty),
+                    shape_type="rect",
+                    width=w, height=h, points=None,
+                    allow_rotation=bool(live_allow_rot)
+                ))
+                st.success(f"Added rectangle ({round(w,precision)} × {round(h,precision)} {_pretty_units(units)})")
+            st.session_state.needs_nest = True
+    except Exception as e:
+        st.warning(f"Could not read live rectangle: {e}")
+    finally:
+        _clear_query_params()
+            
 
         # Read result from query params
         qp = st.query_params
