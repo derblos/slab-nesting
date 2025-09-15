@@ -1,4 +1,4 @@
-# app.py — Polygon-aware nesting + L-split policy + live drawer (postMessage) + bulk add + cutouts
+# app.py — Polygon-aware nesting + L-split policy + live drawer (Streamlit message bus) + bulk add + cutouts
 from __future__ import annotations
 
 import json, math, uuid
@@ -74,7 +74,7 @@ def polygon_with_cutouts(outer_pts: List[Tuple[float,float]], cutouts: List[Tupl
         poly = poly.difference(shp_box(cx, cy, cx+cw, cy+ch))
     return poly
 
-# ---------------- Konva live rectangle drawer (with postMessage Add) ----------------
+# ---------------- Konva live rectangle drawer (talks to Streamlit directly) ----------------
 def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px=600):
     payload = json.dumps({"units": units_label, "ppu": ppu, "w": int(width_px), "h": int(height_px)})
     html = f"""
@@ -137,7 +137,7 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         if (!start || !rect) return;
         const pos = stage.getPointerPosition();
         const w = pos.x - start.x;
-               const h = pos.y - start.y;
+        const h = pos.y - start.y;
         rect.width(w); rect.height(h);
         const txt = label.getChildren()[1];
         txt.text(fmt(Math.abs(w)) + ' × ' + fmt(Math.abs(h)) + ' {units_label}');
@@ -152,13 +152,25 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         return {{ w: Math.abs(rect.width())/scale, h: Math.abs(rect.height())/scale }};
       }}
 
-      // Send dims to parent via postMessage; Streamlit listens (we add a small listener below in Python)
+      // Send to Streamlit main app: set query param and trigger rerun
+      function sendToStreamlit(data) {{
+        try {{
+          const msg1 = {{ type: "streamlit:setQueryParams", queryParams: {{ "live_rect": JSON.stringify(data) }} }};
+          window.parent.postMessage(msg1, "*");
+          const msg2 = {{ type: "streamlit:rerun" }};
+          window.parent.postMessage(msg2, "*");
+        }} catch (e) {{
+          console.error("postMessage to Streamlit failed", e);
+        }}
+      }}
+
       document.getElementById('add-rect-btn').addEventListener('click', () => {{
         const data = getRect();
-        window.parent.postMessage({{ type: "live_rect", data }}, "*");
+        sendToStreamlit(data);
       }});
     </script>
     """
+    # single iframe; no extra listeners elsewhere
     components.html(html, height=int(height_px)+60, scrolling=False)
 
 # ---------------- Sidebar ----------------
@@ -170,7 +182,7 @@ with st.sidebar:
 
     st.markdown("### Drawing canvas size")
     canvas_w = st.number_input("Canvas width (px)", min_value=600, max_value=2400, value=1200, step=50, key="sb_canvas_w")
-    canvas_h = st.number_input("Canvas height (px)", min_value=400, max_value=2000, value=850, step=50, key="sb_canvas_h")
+    canvas_h = st.number_input("Canvas height (px)", min_value=400, max_value=2000, value=900, step=50, key="sb_canvas_h")
 
     st.markdown("### Sheet")
     sheet_w = st.number_input(f"Sheet width ({_pretty_units(units)})", min_value=1.0, value=97.0, step=1.0, format="%.2f", key="sb_sheet_w")
@@ -198,7 +210,7 @@ with st.sidebar:
         _init_state()
         st.success("Project cleared.")
 
-# ---------------- Utility: query param helpers + postMessage listener ----------------
+# ---------------- Query param helpers ----------------
 def _get_query_params():
     if hasattr(st, "query_params"):
         return st.query_params
@@ -216,23 +228,7 @@ def _clear_query_params():
     except Exception:
         pass
 
-# Listen for postMessage from the Konva iframe; when received, write ?live_rect=... to parent URL
-components.html("""
-<script>
-window.addEventListener("message", (event) => {
-  if (event && event.data && event.data.type === "live_rect") {
-    try {
-      const vals = JSON.stringify(event.data.data || {w:0,h:0});
-      const url = new URL(window.location.href);
-      url.searchParams.set("live_rect", vals);
-      window.location.href = url.toString(); // triggers Streamlit rerun
-    } catch (e) { /* no-op */ }
-  }
-});
-</script>
-""", height=0)
-
-# ---------------- Main layout (single column; nesting moved below) ----------------
+# ---------------- Main layout (single column; nesting is below) ----------------
 st.title("Nesting Tool")
 
 # Tool chooser
@@ -490,7 +486,7 @@ with st.expander("Add the current shape to the Parts list (classic tools)", expa
                 st.session_state.needs_nest = True
                 st.success("Added L-shape" + (" (with cutout(s))." if (add_cut and cut_list) else "."))
 
-# ---------- Handle live_rect query param (set by postMessage listener) ----------
+# ---------- Handle live_rect set by Konva (via setQueryParams + rerun) ----------
 qp = _get_query_params()
 raw = qp.get("live_rect")
 if isinstance(raw, list):
@@ -503,43 +499,33 @@ if raw:
         if w <= 0 or h <= 0:
             st.warning("Draw a rectangle first (drag on the canvas).")
         else:
-            if ('live_rect_cut_toggle' in st.session_state and st.session_state['live_rect_cut_toggle']) and ('lr_cw_0' in st.session_state):
-                # Rebuild cutouts from state (if any)
-                cut_list_live_re = []
-                n_guess = 10
-                for i in range(n_guess):
+            # Rebuild cutouts if the toggles/values are present in state
+            cut_list_live_re: List[Tuple[float,float,float,float]] = []
+            if st.session_state.get("live_rect_cut_toggle"):
+                # Probe up to 10 cutout rows (only those that exist will be used)
+                for i in range(10):
                     cw_k, ch_k, cx_k, cy_k = f"lr_cw_{i}", f"lr_ch_{i}", f"lr_cx_{i}", f"lr_cy_{i}"
-                    if cw_k in st.session_state and ch_k in st.session_state and cx_k in st.session_state and cy_k in st.session_state:
+                    if all(k in st.session_state for k in (cw_k, ch_k, cx_k, cy_k)):
                         cut_list_live_re.append((
                             float(st.session_state[cx_k]),
                             float(st.session_state[cy_k]),
                             float(st.session_state[cw_k]),
-                            float(st.session_state[cy_k] if False else st.session_state[ch_k])  # just to be explicit; same as ch_k
+                            float(st.session_state[ch_k]),
                         ))
-                if cut_list_live_re:
-                    outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
-                    poly = polygon_with_cutouts(outer, cut_list_live_re)
-                    st.session_state.parts.append(Part(
-                        id=str(uuid.uuid4()),
-                        label=(st.session_state.get("live_rect_label") or f"Rect-{len(st.session_state.parts)+1}"),
-                        qty=int(st.session_state.get("live_rect_qty", 1)),
-                        shape_type="polygon",
-                        width=None, height=None,
-                        points=list(poly.exterior.coords),
-                        allow_rotation=bool(st.session_state.get("live_rect_rot", True)),
-                        meta={"cutouts": cut_list_live_re}
-                    ))
-                    st.success(f"Added rectangle with {len(cut_list_live_re)} cutout(s)")
-                else:
-                    st.session_state.parts.append(Part(
-                        id=str(uuid.uuid4()),
-                        label=(st.session_state.get("live_rect_label") or f"Rect-{len(st.session_state.parts)+1}"),
-                        qty=int(st.session_state.get("live_rect_qty", 1)),
-                        shape_type="rect",
-                        width=w, height=h, points=None,
-                        allow_rotation=bool(st.session_state.get("live_rect_rot", True))
-                    ))
-                    st.success(f"Added rectangle ({round(w,st.session_state.get('sb_precision',2))} × {round(h,st.session_state.get('sb_precision',2))} {_pretty_units(st.session_state.get('sb_units','in'))})")
+            if cut_list_live_re:
+                outer = [(0,0),(w,0),(w,h),(0,h),(0,0)]
+                poly = polygon_with_cutouts(outer, cut_list_live_re)
+                st.session_state.parts.append(Part(
+                    id=str(uuid.uuid4()),
+                    label=(st.session_state.get("live_rect_label") or f"Rect-{len(st.session_state.parts)+1}"),
+                    qty=int(st.session_state.get("live_rect_qty", 1)),
+                    shape_type="polygon",
+                    width=None, height=None,
+                    points=list(poly.exterior.coords),
+                    allow_rotation=bool(st.session_state.get("live_rect_rot", True)),
+                    meta={"cutouts": cut_list_live_re}
+                ))
+                st.success(f"Added rectangle with {len(cut_list_live_re)} cutout(s)")
             else:
                 st.session_state.parts.append(Part(
                     id=str(uuid.uuid4()),
@@ -644,7 +630,7 @@ def split_rect_if_needed(p: Part, sheet_w: float, sheet_h: float,
                     if merged > usable_h + 1e-9:
                         st.session_state.messages.append(f"⚠️ Cannot split {p.label}: panel too short.")
                         return [p], False
-                    parts_out.append(Part(id=str(uuid.uuid4()), label=f"{p.label}-S{idx-1}", qty=p.qty,
+                    parts_out.append(Part(id=str(uuid.uuid.uuid4()), label=f"{p.label}-S{idx-1}", qty=p.qty,
                                           shape_type="rect", width=W, height=merged, points=None,
                                           allow_rotation=p.allow_rotation, meta={"from": p.id}))
                 else:
@@ -872,7 +858,6 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
                 _poly_to_rect_anno(d["poly"], d["label"], st.session_state.get("sb_precision", 2)) for d in placed
             ]}
             placed = []
-            # try origin on new sheet
             for ang in ([0, 90] if rotation_effective else [0]):
                 poly_try = shp_rotate(base_poly, ang, origin=(0,0), use_radians=False)
                 if poly_try.buffer(buffer_clear).within(sheet_poly):
@@ -898,7 +883,7 @@ if do_nest:
         else:
             sheets = list(poly_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global, grid_step=0.5))
             placed_area = sum(p["w"] * p["h"] for s in sheets for p in s["placements"])
-            util = placed_area / max(1e-9, len(sheets)*sheet_w*sheet_h)  # lower bound (bbox)
+            util = placed_area / max(1e-9, len(sheets)*sheet_w*sheet_h)
             st.session_state.placements, st.session_state.utilization = sheets, util
         st.session_state.needs_nest = False
 
