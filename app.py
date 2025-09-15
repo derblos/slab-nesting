@@ -78,7 +78,20 @@ def polygon_with_cutouts(outer_pts: List[Tuple[float,float]], cutouts: List[Tupl
 def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px=600):
     payload = json.dumps({"units": units_label, "ppu": ppu, "w": int(width_px), "h": int(height_px)})
     html = f"""
-    <div id="konva-live-root"></div>
+    <style>
+      #konva-wrap {{ position: relative; width: {int(width_px)}px; }}
+      #konva-live-root {{ }}
+      #add-rect-btn {{
+        position: absolute; right: 10px; bottom: 10px;
+        padding: 8px 12px; border: 1px solid #aaa; border-radius: 6px;
+        background: #fff; cursor: pointer; font-family: sans-serif;
+      }}
+    </style>
+    <div id="konva-wrap">
+      <div id="konva-live-root"></div>
+      <button id="add-rect-btn">➕ Add this rectangle</button>
+    </div>
+
     <script src="https://unpkg.com/konva@9.3.3/konva.min.js"></script>
     <script>
       const cfg = {payload};
@@ -113,9 +126,7 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         }});
         label = new Konva.Label({{ x: start.x + 8, y: start.y - 26 }});
         label.add(new Konva.Tag({{ fill: 'rgba(255,255,255,0.9)', stroke: '#aaa' }}));
-        label.add(new Konva.Text({{
-          text: '', fontSize: 12, fill: '#111', padding: 4
-        }}));
+        label.add(new Konva.Text({{ text: '', fontSize: 12, fill: '#111', padding: 4 }}));
         layer.add(rect); layer.add(label);
         layer.draw();
       }});
@@ -127,20 +138,38 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         const h = pos.y - start.y;
         rect.width(w); rect.height(h);
         const txt = label.getChildren()[1];
-        txt.text(fmt(Math.abs(w)) + ' × ' + fmt(Math.abs(h)) + ' ' + cfg.units);
+        txt.text(fmt(Math.abs(w)) + ' × ' + fmt(Math.abs(h)) + ' {units_label}');
         label.position({{ x: start.x + 8, y: start.y - 26 }});
         layer.batchDraw();
       }});
 
       stage.on('mouseup', () => {{ start = null; }});
 
+      // Expose getter (still handy for debugging)
       window.getLiveRect = () => {{
         if (!rect) return {{ w: 0, h: 0 }};
         return {{ w: Math.abs(rect.width())/scale, h: Math.abs(rect.height())/scale }};
       }};
+
+      // Add button INSIDE this iframe -> updates parent URL, triggers Streamlit rerun
+      document.getElementById('add-rect-btn').addEventListener('click', () => {{
+        const data = window.getLiveRect();
+        const parent = window.top || window.parent;
+        try {{
+          const url = new URL(parent.location.href);
+          url.searchParams.set('live_rect', JSON.stringify(data));
+          parent.location.href = url.toString();  // reload parent with param
+        }} catch (e) {{
+          // Fallback: try hash if search is blocked
+          try {{
+            const base = parent.location.href.split('#')[0];
+            parent.location.href = base + '#live_rect=' + encodeURIComponent(JSON.stringify(data));
+          }} catch(e2) {{}}
+        }}
+      }});
     </script>
     """
-    components.html(html, height=int(height_px)+10, scrolling=False)
+    components.html(html, height=int(height_px)+50, scrolling=False)
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -237,23 +266,6 @@ with left:
                     cy = st.number_input(f"Y{i+1} offset", value=10.0, step=0.5, format="%.2f", key=f"lr_cy_{i}")
                 cut_list_live.append((cx, cy, cw, ch))
 
-        # Button to pull dims from the browser and add the rectangle
-        add_live_clicked = st.button("➕ Add this rectangle", type="secondary", key="btn_add_live_rect")
-        if add_live_clicked:
-            # Inject tiny form to grab window.getLiveRect() and write to parent URL
-            components.html("""
-            <form method="get" target="_parent" action="">
-              <input type="hidden" name="live_rect" id="lr">
-              <button type="submit" style="display:none;">submit</button>
-              <script>
-                try {
-                  const data = window.getLiveRect ? window.getLiveRect() : {w:0,h:0};
-                  document.getElementById('lr').value = JSON.stringify(data);
-                  document.forms[0].submit();
-                } catch(e) {}
-              </script>
-            </form>
-            """, height=0)
 
     # ---- Read & consume the query param (support old/new Streamlit)
     def _get_query_params():
