@@ -89,7 +89,11 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
     </style>
     <div id="konva-wrap">
       <div id="konva-live-root"></div>
-      <button id="add-rect-btn">➕ Add this rectangle</button>
+      <button id="add-rect-btn" type="button">➕ Add this rectangle</button>
+      <!-- hidden form that submits to the TOP window -->
+      <form id="lr-form" method="GET" target="_top" action="">
+        <input type="hidden" id="lr-input" name="live_rect" value="">
+      </form>
     </div>
 
     <script src="https://unpkg.com/konva@9.3.3/konva.min.js"></script>
@@ -126,9 +130,7 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         }});
         label = new Konva.Label({{ x: start.x + 8, y: start.y - 26 }});
         label.add(new Konva.Tag({{ fill: 'rgba(255,255,255,0.9)', stroke: '#aaa' }}));
-        label.add(new Konva.Text({{
-          text: '', fontSize: 12, fill: '#111', padding: 4
-        }}));
+        label.add(new Konva.Text({{ text: '', fontSize: 12, fill: '#111', padding: 4 }}));
         layer.add(rect); layer.add(label);
         layer.draw();
       }});
@@ -152,26 +154,16 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
         return {{ w: Math.abs(rect.width())/scale, h: Math.abs(rect.height())/scale }};
       }}
 
-      // Send to Streamlit main app: set query param and trigger rerun
-      function sendToStreamlit(data) {{
-        try {{
-          const msg1 = {{ type: "streamlit:setQueryParams", queryParams: {{ "live_rect": JSON.stringify(data) }} }};
-          window.parent.postMessage(msg1, "*");
-          const msg2 = {{ type: "streamlit:rerun" }};
-          window.parent.postMessage(msg2, "*");
-        }} catch (e) {{
-          console.error("postMessage to Streamlit failed", e);
-        }}
-      }}
-
       document.getElementById('add-rect-btn').addEventListener('click', () => {{
         const data = getRect();
-        sendToStreamlit(data);
+        // write JSON into hidden input and submit to TOP window
+        document.getElementById('lr-input').value = JSON.stringify(data);
+        document.getElementById('lr-form').submit();
       }});
     </script>
     """
-    # single iframe; no extra listeners elsewhere
     components.html(html, height=int(height_px)+60, scrolling=False)
+
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
