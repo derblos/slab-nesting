@@ -165,6 +165,7 @@ def render_konva_rect_drawer(units_label="in", ppu=8.0, width_px=1000, height_px
     components.html(html, height=int(height_px)+60, scrolling=False)
 
 
+
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("Project settings")
