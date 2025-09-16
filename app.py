@@ -1,7 +1,7 @@
-# app.py — Reliable no-iframe build: polygon-aware nesting + L-split policy + classic canvas (rect/polygon) + bulk add + cutouts
+# app.py — Reliable classic canvas build: polygon-aware nesting + L-split policy + bulk add + cutouts
 from __future__ import annotations
 
-import json, math, uuid
+import math, uuid
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -104,7 +104,7 @@ with st.sidebar:
     L_max_leg_no_split = st.number_input(f"Max leg length without split ({_pretty_units(units)})", min_value=1.0, value=48.0, step=1.0, format="%.0f", key="sb_L_max_leg")
 
     st.markdown("---")
-    if st.button("🗑️ Clear project", use_container_width=True, type="primary", key="sb_clear_project"):
+    if st.button("🗑️ Clear project", type="primary", key="sb_clear_project"):
         for k in ["parts", "needs_nest", "placements", "utilization", "messages", "draw_canvas_key"]:
             st.session_state.pop(k, None)
         _init_state()
@@ -120,7 +120,7 @@ tool = st.radio(
     key="tool_radio"
 )
 
-# Always use the classic canvas (reliable)
+# Classic canvas (reliable)
 drawing_mode = "rect" if tool == "Rectangle" else "polygon"
 canvas_key = st.session_state.get("draw_canvas_key", "draw_canvas")
 
@@ -145,15 +145,16 @@ if canvas_result and canvas_result.json_data:
     if objs:
         last_obj = objs[-1]
         if drawing_mode == "rect" and last_obj.get("type") == "rect":
-            w_px, h_px = _fabric_rect_dims(last_obj)
-            live_w = round(w_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
-            live_h = round(h_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
+            w_px = float(last_obj.get("width", 0)) * float(last_obj.get("scaleX", 1.0))
+            h_px = float(last_obj.get("height", 0)) * float(last_obj.get("scaleY", 1.0))
+            live_w = round(abs(w_px) / px_per_unit, precision)
+            live_h = round(abs(h_px) / px_per_unit, precision)
         elif drawing_mode != "rect" and last_obj.get("path"):
             pts = _fabric_polygon_points(last_obj)
             if len(pts) >= 3:
                 bw, bh = _bbox_of_polygon(pts)
-                live_w = round(bw / st.session_state["sb_ppu"], st.session_state["sb_precision"])
-                live_h = round(bh / st.session_state["sb_ppu"], st.session_state["sb_precision"])
+                live_w = round(bw / px_per_unit, precision)
+                live_h = round(bh / px_per_unit, precision)
 
 col_live = st.columns(2)
 with col_live[0]:
@@ -191,8 +192,8 @@ with st.expander("Add the current shape to the Parts list", expanded=True):
                 st.warning("Draw a rectangle first.")
             else:
                 w_px, h_px = _fabric_rect_dims(last_obj)
-                w = round(w_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
-                h = round(h_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
+                w = round(w_px / px_per_unit, precision)
+                h = round(h_px / px_per_unit, precision)
                 if w <= 0 or h <= 0:
                     st.error("This rectangle has zero width/height.")
                 else:
@@ -225,7 +226,7 @@ with st.expander("Add the current shape to the Parts list", expanded=True):
                 if len(pts) < 3:
                     st.error("Polygon needs at least 3 points.")
                 else:
-                    pts_units = [(x/st.session_state["sb_ppu"], y/st.session_state["sb_ppu"]) for (x,y) in pts]
+                    pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
                     st.session_state.parts.append(Part(
                         id=str(uuid.uuid4()), label=label or f"Poly-{len(st.session_state.parts)+1}",
                         qty=int(qty), shape_type="polygon",
@@ -247,8 +248,8 @@ with bulk_cols[0]:
             for obj in objs:
                 if obj.get("type") == "rect":
                     w_px, h_px = _fabric_rect_dims(obj)
-                    w = round(w_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
-                    h = round(h_px / st.session_state["sb_ppu"], st.session_state["sb_precision"])
+                    w = round(w_px / px_per_unit, precision)
+                    h = round(h_px / px_per_unit, precision)
                     if w > 0 and h > 0:
                         st.session_state.parts.append(Part(
                             id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
@@ -259,7 +260,7 @@ with bulk_cols[0]:
                 elif obj.get("path"):
                     pts = _fabric_polygon_points(obj)
                     if len(pts) >= 3:
-                        pts_units = [(x/st.session_state["sb_ppu"], y/st.session_state["sb_ppu"]) for (x,y) in pts]
+                        pts_units = [(x/px_per_unit, y/px_per_unit) for (x,y) in pts]
                         st.session_state.parts.append(Part(
                             id=str(uuid.uuid4()), label=f"Draw-{len(st.session_state.parts)+1}",
                             qty=1, shape_type="polygon", width=None, height=None,
@@ -276,7 +277,7 @@ with bulk_cols[1]:
 with bulk_cols[2]:
     st.caption("Tip: draw multiple shapes first, then **Add all**.")
 
-# ---------- Parametric L-shape ----------
+# ---------- L-shape (parametric) ----------
 if tool == "L-shape (parametric)":
     st.markdown("### Create L-shape")
     colA, colB = st.columns(2)
@@ -354,8 +355,8 @@ else:
         rows.append({
             "id": p.id, "Label": p.label,
             "Type": ("L" if p.meta.get("is_L") else p.shape_type),
-            "Width": round(p.width, st.session_state["sb_precision"]) if p.width is not None else None,
-            "Height": round(p.height, st.session_state["sb_precision"]) if p.height is not None else None,
+            "Width": round(p.width, precision) if p.width is not None else None,
+            "Height": round(p.height, precision) if p.height is not None else None,
             "Qty": p.qty,
             "Allow Rotation": p.allow_rotation,
         })
@@ -516,7 +517,9 @@ def rectpack_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: 
             for _ in range(p.qty):
                 expanded.append(s)
 
-    rotation_effective = rotation and (not any_split)
+    # FIX A: keep rotation allowed if user enabled it
+    rotation_effective = rotation
+
     packer = newPacker(rotation=rotation_effective)
     EPS = 1e-6
 
@@ -617,10 +620,11 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
             for _ in range(s.qty):
                 expanded.append((s, shp))
 
-    rotation_effective = rotation and (not any_split)
+    # FIX A again: keep rotation allowed if the user wants it
+    rotation_effective = rotation
 
     placed = []
-    # give a tiny inward buffer to the sheet to avoid precision misses at edges
+    # tiny inward buffer to avoid precision misses right on the edges
     sheet_poly = shp_box(0, 0, sheet_w, sheet_h).buffer(-1e-9)
     buffer_clear = clearance / 2.0 if clearance > 0 else 0.0
 
@@ -635,10 +639,11 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
                 x = 0.0
                 while x <= sheet_w and not placed_ok:
                     test = shp_translate(poly, xoff=x, yoff=y)
-                    # within check w/ tiny tolerance
-                    bounds_ok = test.buffer(buffer_clear).within(sheet_poly)
+                    # FIX B: only require the raw part to be inside the sheet
+                    bounds_ok = test.within(sheet_poly)
                     if not bounds_ok:
                         x += grid_step; continue
+                    # keep clearance only for part-to-part collisions
                     collision = any(test.buffer(buffer_clear).intersects(o["poly"].buffer(buffer_clear)) for o in placed)
                     if not collision:
                         placed.append({"poly": test, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": ang})
@@ -652,12 +657,12 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
             # finish current sheet
             yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
                 _poly_to_rect_anno(d["poly"], d["label"], st.session_state.get("sb_precision", 2)) for d in placed
-            ]}
+            ])}
             placed = []
             # attempt to place on a fresh sheet at origin (0 or 90)
             for ang in ([0, 90] if rotation_effective else [0]):
                 ptry = shp_rotate(base_poly, ang, origin=(0,0), use_radians=False)
-                if ptry.buffer(buffer_clear).within(sheet_poly):
+                if ptry.within(sheet_poly):
                     placed.append({"poly": ptry, "label": s.label, "rid": f"{s.label}#{uuid.uuid4().hex[:4]}", "angle": ang})
                     break
             if not placed:
@@ -665,7 +670,7 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
     if placed:
         yield {"sheet_w": sheet_w, "sheet_h": sheet_h, "placements": [
             _poly_to_rect_anno(d["poly"], d["label"], st.session_state.get("sb_precision", 2)) for d in placed
-        ]}
+        ])}
 
 # -------- Run nesting --------
 do_nest = st.button("🧩 Nest parts", type="primary", key="btn_nest")
@@ -674,7 +679,7 @@ if do_nest:
         st.warning("Add some parts first.")
     else:
         st.session_state.messages = []
-        if st.session_state["sb_mode"] == "Fast (rectpack)":
+        if mode == "Fast (rectpack)":
             sheets, util = rectpack_nest(st.session_state.parts, sheet_w, sheet_h, clearance, allow_rotation_global)
             st.session_state.placements, st.session_state.utilization = sheets, util
         else:
@@ -709,7 +714,7 @@ if st.session_state.placements:
             x, y, w, h, label = place["x"], place["y"], place["w"], place["h"], place["label"]
             fig.add_shape(type="rect", x0=x, y0=y, x1=x+w, y1=y+h, line=dict(width=1), fillcolor="rgba(100,150,250,0.15)")
             fig.add_annotation(x=x+w/2, y=y+h/2,
-                               text=f"{label}<br>{round(w, st.session_state['sb_precision'])} × {round(h, st.session_state['sb_precision'])}",
+                               text=f"{label}<br>{round(w, precision)} × {round(h, precision)}",
                                showarrow=False, font=dict(size=12))
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
         fig.update_layout(
