@@ -625,7 +625,7 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
 
     placed = []
     # tiny inward buffer to avoid precision misses right on the edges
-    sheet_poly = shp_box(0, 0, sheet_w, sheet_h).buffer(-1e-9)
+    sheet_poly = shp_box(0, 0, sheet_w, sheet_h) 
     buffer_clear = clearance / 2.0 if clearance > 0 else 0.0
 
     for s, base_poly in sorted(expanded, key=lambda t: t[1].area, reverse=True):
@@ -640,7 +640,7 @@ def poly_nest(parts: List[Part], sheet_w: float, sheet_h: float, clearance: floa
                 while x <= sheet_w and not placed_ok:
                     test = shp_translate(poly, xoff=x, yoff=y)
                     # FIX B: only require the raw part to be inside the sheet
-                    bounds_ok = test.within(sheet_poly)
+                    bounds_ok = sheet_poly.covers(test) 
                     if not bounds_ok:
                         x += grid_step; continue
                     # keep clearance only for part-to-part collisions
