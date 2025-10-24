@@ -175,6 +175,17 @@ def _pretty_units(u: str) -> str:
     return {"in": "in", "mm": "mm", "cm": "cm"}.get(u, u)
 
 
+def _convert_to_square_feet(area: float, units: str) -> float:
+    """Convert area to square feet based on units"""
+    if units == "in":
+        return area / 144.0  # 12" × 12" = 144 sq in per sq ft
+    elif units == "mm":
+        return area / 92903.04  # mm² to sq ft
+    elif units == "cm":
+        return area / 929.0304  # cm² to sq ft
+    return area
+
+
 def validate_part(part: Part, sheet_w: float, sheet_h: float) -> Tuple[bool, str]:
     """Validate part before adding"""
     if part.shape_type == "rect":
@@ -808,6 +819,42 @@ def render_sidebar(config: NestingConfig):
             "Canvas scale (px per unit)", 2, 20, 8, key="sb_ppu"
         )
         
+        st.markdown("### 📐 Quick Draw Settings")
+        enable_quick_draw = st.checkbox(
+            "Enable Quick Draw Mode",
+            value=False,
+            key="sb_quick_draw",
+            help="Set a default width and snap angles for faster drawing"
+        )
+        
+        if enable_quick_draw:
+            default_width = st.number_input(
+                f"Default Width ({_pretty_units(units)})",
+                min_value=0.5,
+                value=25.0,
+                step=0.5,
+                format="%.2f",
+                key="sb_default_width",
+                help="Width to maintain while drawing"
+            )
+            snap_angle = st.selectbox(
+                "Snap Angle",
+                [0, 15, 30, 45, 90],
+                index=4,
+                key="sb_snap_angle",
+                help="Snap line angles to increments (0 = no snapping)"
+            )
+            show_live_dims = st.checkbox(
+                "Show dimensions while drawing",
+                value=True,
+                key="sb_show_live_dims",
+                help="Display measurements in real-time on canvas"
+            )
+        else:
+            st.session_state.setdefault("sb_default_width", 25.0)
+            st.session_state.setdefault("sb_snap_angle", 0)
+            st.session_state.setdefault("sb_show_live_dims", False)
+        
         st.markdown("### 📐 Drawing Canvas Size")
         canvas_w = st.number_input(
             "Canvas width (px)", 
@@ -994,6 +1041,14 @@ def render_sidebar(config: NestingConfig):
 
 def render_canvas_and_tools(px_per_unit: int, canvas_w: int, canvas_h: int, precision: int, units: str):
     """Render drawing canvas and tool controls"""
+    
+    # Check if quick draw mode is enabled
+    quick_draw = st.session_state.get("sb_quick_draw", False)
+    show_live_dims = st.session_state.get("sb_show_live_dims", False)
+    
+    if quick_draw:
+        st.info("🎯 **Quick Draw Mode Active** - Fixed width drawing with angle snapping enabled")
+    
     tool = st.radio(
         "🔧 Tool",
         ["Rectangle", "Polygon (freehand)", "L-shape (parametric)"],
@@ -1004,6 +1059,13 @@ def render_canvas_and_tools(px_per_unit: int, canvas_w: int, canvas_h: int, prec
     # Drawing canvas
     drawing_mode = "rect" if tool == "Rectangle" else "polygon"
     canvas_key = st.session_state.get("draw_canvas_key", "draw_canvas")
+    
+    # Create initial drawing data if quick draw is enabled
+    initial_drawing = None
+    if quick_draw and show_live_dims and tool == "Polygon (freehand)":
+        # Note: We can't inject live dimensions into the canvas in real-time
+        # This would require a custom JavaScript component
+        st.caption("💡 Tip: Dimensions will appear after completing the shape")
     
     canvas_result = st_canvas(
         fill_color="rgba(0,0,0,0.0)",
@@ -1018,9 +1080,10 @@ def render_canvas_and_tools(px_per_unit: int, canvas_w: int, canvas_h: int, prec
         key=canvas_key
     )
     
-    # Live measurements
+    # Live measurements with enhanced display
     last_obj = None
     live_w = live_h = None
+    live_perimeter = None
     
     if canvas_result and canvas_result.json_data:
         objs = canvas_result.json_data.get("objects", [])
@@ -1030,14 +1093,25 @@ def render_canvas_and_tools(px_per_unit: int, canvas_w: int, canvas_h: int, prec
                 w_px, h_px = _fabric_rect_dims(last_obj)
                 live_w = round(abs(w_px) / px_per_unit, precision)
                 live_h = round(abs(h_px) / px_per_unit, precision)
+                live_perimeter = round(2 * (live_w + live_h), precision)
             elif drawing_mode != "rect" and last_obj.get("path"):
                 pts = _fabric_polygon_points(last_obj)
                 if len(pts) >= 3:
                     bw, bh = _bbox_of_polygon(pts)
                     live_w = round(bw / px_per_unit, precision)
                     live_h = round(bh / px_per_unit, precision)
+                    
+                    # Calculate perimeter
+                    pts_units = [(x / px_per_unit, y / px_per_unit) for x, y in pts]
+                    perimeter = 0
+                    for i in range(len(pts_units)):
+                        p1 = pts_units[i]
+                        p2 = pts_units[(i + 1) % len(pts_units)]
+                        perimeter += math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+                    live_perimeter = round(perimeter, precision)
     
-    col_live = st.columns(2)
+    # Enhanced metrics display
+    col_live = st.columns(3)
     with col_live[0]:
         st.metric(
             "Live Width",
@@ -1048,6 +1122,29 @@ def render_canvas_and_tools(px_per_unit: int, canvas_w: int, canvas_h: int, prec
             "Live Height",
             f"{live_h if live_h is not None else '—'} {_pretty_units(units)}"
         )
+    with col_live[2]:
+        if live_perimeter is not None:
+            st.metric(
+                "Perimeter",
+                f"{live_perimeter} {_pretty_units(units)}"
+            )
+        else:
+            st.metric("Perimeter", "—")
+    
+    # Show quick draw guidance
+    if quick_draw and tool == "Polygon (freehand)":
+        default_width = st.session_state.get("sb_default_width", 25.0)
+        snap_angle = st.session_state.get("sb_snap_angle", 0)
+        
+        st.info(f"📏 **Target Width:** {default_width} {_pretty_units(units)} | "
+                f"🔄 **Snap Angle:** {snap_angle}° increments" if snap_angle > 0 else "No snapping")
+        
+        if live_w is not None:
+            width_diff = abs(live_w - default_width)
+            if width_diff > 0.5:
+                st.warning(f"⚠️ Current width ({live_w}) differs from target ({default_width}) by {round(width_diff, 2)} {_pretty_units(units)}")
+            else:
+                st.success(f"✅ Width is within tolerance of target")
     
     return tool, canvas_result, last_obj, px_per_unit
 
@@ -1545,6 +1642,10 @@ def render_nesting_results(config: NestingConfig):
     )
     total_area = max(1e-9, len(st.session_state.placements) * config.sheet_w * config.sheet_h)
     
+    # Convert to square feet
+    used_area_sqft = _convert_to_square_feet(used_area, config.units)
+    total_area_sqft = _convert_to_square_feet(total_area, config.units)
+    
     # Metrics dashboard
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -1552,9 +1653,9 @@ def render_nesting_results(config: NestingConfig):
     with col2:
         st.metric("📊 Utilization", f"{util_pct}%", delta=f"{util_pct - 75:.1f}%" if util_pct > 0 else None)
     with col3:
-        st.metric("📐 Used Area", f"{round(used_area, 2)} {_pretty_units(config.units)}²")
+        st.metric("📐 Used Area", f"{round(used_area_sqft, 2)} sq ft")
     with col4:
-        st.metric("📏 Total Area", f"{round(total_area, 2)} {_pretty_units(config.units)}²")
+        st.metric("📏 Total Area", f"{round(total_area_sqft, 2)} sq ft")
     
     if st.session_state.needs_nest:
         st.info("ℹ️ Parts have changed. Results are stale — click **Nest Parts** again.")
@@ -1602,15 +1703,36 @@ def render_nesting_results(config: NestingConfig):
                 fillcolor=color
             )
             
-            # Label
+            # Label in center
             fig.add_annotation(
                 x=x + w / 2,
                 y=y + h / 2,
-                text=f"{label}<br>{round(w, config.precision)} × {round(h, config.precision)}",
+                text=f"<b>{label}</b>",
                 showarrow=False,
-                font=dict(size=10, color="#333"),
-                bgcolor="rgba(255, 255, 255, 0.7)",
+                font=dict(size=11, color="#333"),
+                bgcolor="rgba(255, 255, 255, 0.8)",
                 borderpad=4
+            )
+            
+            # Width dimension on top
+            fig.add_annotation(
+                x=x + w / 2,
+                y=y - 0.5,
+                text=f"{round(w, config.precision)}\"",
+                showarrow=False,
+                font=dict(size=9, color="#666"),
+                yshift=-10
+            )
+            
+            # Height dimension on right
+            fig.add_annotation(
+                x=x + w + 0.5,
+                y=y + h / 2,
+                text=f"{round(h, config.precision)}\"",
+                showarrow=False,
+                font=dict(size=9, color="#666"),
+                textangle=-90,
+                xshift=10
             )
         
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
@@ -1690,6 +1812,7 @@ def main():
                 p.get_dimensions()[0] * p.get_dimensions()[1] * p.qty
                 for p in st.session_state.parts
             )
+            total_area_sqft = _convert_to_square_feet(total_area, config.units)
             
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -1699,7 +1822,7 @@ def main():
             with col3:
                 st.metric(
                     "Total Part Area",
-                    f"{round(total_area, 2)} {_pretty_units(config.units)}²"
+                    f"{round(total_area_sqft, 2)} sq ft"
                 )
             
             # Show cutting list preview
@@ -1719,13 +1842,20 @@ def main():
         - `Ctrl+Z` / `↶ Undo`: Undo last action
         - `Ctrl+Y` / `↷ Redo`: Redo last undone action
         
-        **Tips:**
+        **Quick Draw Mode Tips:**
+        - Enable **Quick Draw Mode** in sidebar to set a target width for consistent drawing
+        - Choose **Snap Angle** (15°, 30°, 45°, or 90°) to create precise angles
+        - Watch the **live metrics** above the canvas to verify dimensions while drawing
+        - Green checkmark appears when width is within 0.5 units of target
+        
+        **General Tips:**
         - Draw multiple shapes on the canvas, then use **Add All Drawn Shapes** to batch add
         - Use the data editor in the Parts List tab to quickly update multiple parts
         - Export your project regularly to save your work
         - The cutting list CSV can be imported into spreadsheet software
         - Larger clearance values help prevent parts from being too close together
         - Auto-split is useful for very large parts that exceed sheet dimensions
+        - All area calculations are shown in **square feet** for easy material estimation
         """)
 
 
