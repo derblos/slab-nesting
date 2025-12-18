@@ -1,4 +1,31 @@
-streamlit==1.31.1
-pandas
-streamlit-drawable-canvas
-Pillow
+# Nesting Tool Pro - Python Dependencies
+# Last updated: 2025-12-18
+# Python 3.8+ required
+
+# Core Framework
+# streamlit: Web application framework for data apps
+# Updated from 1.31.1 to 1.52.2 to fix CVE-2024-42474 (PYSEC-2024-153)
+streamlit==1.52.2
+
+# Data Processing
+# pandas: Data manipulation and analysis
+pandas==2.3.3
+
+# Visualization
+# plotly: Interactive plotting library (MISSING - added)
+plotly==6.5.0
+
+# Geometry & Packing
+# rectpack: Rectangle packing algorithms for nesting optimization (MISSING - added)
+rectpack==0.2.2
+
+# shapely: Geometric operations for polygon handling (MISSING - added)
+shapely==2.1.2
+
+# UI Components
+# streamlit-drawable-canvas: Canvas drawing component for Streamlit
+streamlit-drawable-canvas==0.9.3
+
+# Image Processing
+# Pillow: Python Imaging Library (required by streamlit-drawable-canvas)
+Pillow==12.0.0
