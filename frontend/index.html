@@ -15,6 +15,11 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <!-- VERSION TEST BANNER -->
+    <div style="background: #e74c3c; color: white; padding: 10px; text-align: center; font-weight: bold; font-size: 16px;">
+        ✅ VERSION 2.0 - DRAWING TOOL LOADED ✅
+    </div>
+
     <!-- Header -->
     <header class="app-header">
         <div class="header-left">
@@ -99,16 +104,33 @@
             <!-- Toolbar -->
             <div class="toolbar">
                 <div class="toolbar-left">
-                    <button class="btn btn-icon" onclick="canvas.clear()" title="Clear Canvas">
+                    <!-- Mode Toggle -->
+                    <button class="btn btn-icon" id="drawModeBtn" onclick="toggleDrawMode()" title="Toggle Draw Mode">
+                        <i class="fas fa-pencil-ruler"></i>
+                    </button>
+                    <div class="divider"></div>
+
+                    <!-- Drawing Controls (shown in draw mode) -->
+                    <div id="drawControls" style="display: none;">
+                        <label class="toolbar-label-input">
+                            <span>Width:</span>
+                            <input type="number" id="drawWidth" value="25.5" step="0.25" min="1" style="width: 70px; padding: 5px; border: 1px solid #bdc3c7; border-radius: 4px;">
+                            <span>"</span>
+                        </label>
+                        <div class="divider"></div>
+                    </div>
+
+                    <!-- Standard Controls -->
+                    <button class="btn btn-icon" onclick="clearCanvas()" title="Clear Canvas">
                         <i class="fas fa-eraser"></i>
                     </button>
                     <button class="btn btn-icon" onclick="resetZoom()" title="Reset View">
                         <i class="fas fa-search-minus"></i>
                     </button>
                     <div class="divider"></div>
-                    <span class="toolbar-label">
+                    <span class="toolbar-label" id="toolbarHint">
                         <i class="fas fa-mouse-pointer"></i>
-                        Click and drag parts to arrange
+                        <span id="hintText">Click parts to add to canvas</span>
                     </span>
                 </div>
                 <div class="toolbar-right">

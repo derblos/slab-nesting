@@ -22,16 +22,27 @@ Professional drag-and-drop interface for the Nesting Tool application.
 - One-click part deletion
 - Click to add to canvas
 
+✏️ **Constrained Drawing Tool** (NEW!)
+- CAD-like width-locked drawing tool for custom countertop shapes
+- Draw with fixed width (default 25.5", adjustable)
+- Right-click to add 90° perpendicular corners automatically
+- Left-click to finish drawing
+- Real-time dimension labels on all sides
+- Click edges to toggle polished/unfinished profiles
+- Visual edge markers (green = polished, red dashed = unfinished)
+- Escape key to cancel drawing in progress
+
 🧩 **Nesting Integration**
 - Connects to FastAPI backend
 - Visual nesting results
-- Utilization metrics
+- Utilization metrics (displayed in square feet)
 - Multi-sheet visualization
 
 ⌨️ **Keyboard Shortcuts**
 - `Ctrl/Cmd + N` - Run nesting
 - `Ctrl/Cmd + A` - Focus add part form
 - `Enter` - Submit add part form
+- `Escape` - Cancel drawing in progress
 
 ## Quick Start
 
@@ -125,6 +136,25 @@ Navigate to: `http://localhost:8080`
 1. Click "Nest Parts" button in toolbar
 2. View results in right sidebar
 3. See visual layout on canvas
+
+**Use Constrained Drawing Tool:**
+1. Click the pencil-ruler icon in the toolbar to activate Draw Mode
+2. Adjust width in the "Width" input (default: 25.5")
+3. **Left-click** on the canvas to start drawing
+4. **Right-click** to add a 90° perpendicular corner at that point
+5. Continue right-clicking to add more corners (automatically perpendicular)
+6. **Left-click** again to finish and save the part
+7. Press **Escape** to cancel drawing in progress
+
+**Edit Edge Profiles:**
+- Click on any edge of a drawn part to toggle between:
+  - **Polished** (green solid line)
+  - **Unfinished** (red dashed line)
+- This helps track which edges need finishing/polishing
+
+**Dimension Labels:**
+- All dimensions are displayed in **inches** on each side during drawing
+- Dimension labels remain visible after drawing is complete
 
 ## Architecture
 
@@ -225,12 +255,12 @@ Open browser Developer Tools (F12):
 
 ## Next Steps
 
-- Add part editing functionality
+- Add angle editing for drawn parts (adjust corners after drawing)
 - Implement project save/load from UI
 - Add export to PDF/DXF
 - Mobile responsive improvements
-- Add custom polygon drawing
 - Implement undo/redo for canvas
+- Add part editing functionality (modify existing parts)
 
 ## Support
 
