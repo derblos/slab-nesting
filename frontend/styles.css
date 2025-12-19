@@ -586,6 +586,71 @@ body {
 }
 
 /* =================================================================
+   Drawing Mode
+   ================================================================= */
+
+#drawModeBtn.active {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+}
+
+.toolbar-label-input {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.drawing-preview {
+    stroke-dasharray: 5, 5;
+    animation: dash 0.5s linear infinite;
+}
+
+@keyframes dash {
+    to {
+        stroke-dashoffset: -10;
+    }
+}
+
+.dimension-label {
+    background: rgba(44, 62, 80, 0.9);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    pointer-events: none;
+}
+
+.edge-marker {
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.edge-marker.polished {
+    stroke: #27ae60;
+    stroke-width: 4;
+}
+
+.edge-marker.unfinished {
+    stroke: #e74c3c;
+    stroke-width: 4;
+    stroke-dasharray: 8, 4;
+}
+
+.edge-marker:hover {
+    stroke-width: 6;
+    opacity: 0.8;
+}
+
+/* Drawing cursor */
+.canvas-wrapper.drawing-mode {
+    cursor: crosshair;
+}
+
+/* =================================================================
    Responsive
    ================================================================= */
 
