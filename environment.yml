@@ -7,6 +7,7 @@ dependencies:
   - pip>=23.0
 
   # Core packages via conda
+  - numpy>=1.24.0,<2.0.0  # Pin to 1.x for PyArrow compatibility
   - pandas>=2.0.0
   - pillow>=10.0.0
 

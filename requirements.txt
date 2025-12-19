@@ -1,6 +1,7 @@
 # Core framework
 streamlit>=1.31.1,<2.0.0
 pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<2.0.0  # Pin to 1.x for PyArrow compatibility
 
 # Visualization
 plotly>=5.18.0,<6.0.0
