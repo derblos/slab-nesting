@@ -1,4 +1,14 @@
-streamlit==1.31.1
-pandas
-streamlit-drawable-canvas
-Pillow
+# Core framework
+streamlit>=1.31.1,<2.0.0
+pandas>=2.0.0,<3.0.0
+
+# Visualization
+plotly>=5.18.0,<6.0.0
+
+# Nesting and geometry
+rectpack>=0.2.2
+shapely>=2.0.0,<3.0.0
+
+# UI components
+streamlit-drawable-canvas>=0.9.3
+Pillow>=10.0.0,<11.0.0

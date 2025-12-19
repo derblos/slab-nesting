@@ -1,0 +1,19 @@
+name: slab-nesting
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - pip>=23.0
+
+  # Core packages via conda
+  - pandas>=2.0.0
+  - pillow>=10.0.0
+
+  # Pip dependencies (not all packages available via conda)
+  - pip:
+      - streamlit>=1.31.1,<2.0.0
+      - plotly>=5.18.0,<6.0.0
+      - rectpack>=0.2.2
+      - shapely>=2.0.0,<3.0.0
+      - streamlit-drawable-canvas>=0.9.3
