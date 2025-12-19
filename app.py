@@ -1,6 +1,7 @@
 # app.py — Enhanced Nesting Tool with all improvements
 from __future__ import annotations
 
+# Standard library imports
 import math
 import uuid
 import json
@@ -8,15 +9,30 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
 import io
+import sys
 
-import pandas as pd
-import plotly.graph_objects as go
-from rectpack import newPacker
-from shapely.affinity import rotate as shp_rotate, translate as shp_translate
-from shapely.geometry import Polygon, box as shp_box
-
-import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+# Third-party imports with error handling
+try:
+    import pandas as pd
+    import plotly.graph_objects as go
+    from rectpack import newPacker
+    from shapely.affinity import rotate as shp_rotate, translate as shp_translate
+    from shapely.geometry import Polygon, box as shp_box
+    import streamlit as st
+    from streamlit_drawable_canvas import st_canvas
+except ImportError as e:
+    missing_package = str(e).split("'")[1] if "'" in str(e) else "unknown"
+    print(f"\n{'='*70}")
+    print(f"❌ ERROR: Missing required package '{missing_package}'")
+    print(f"{'='*70}")
+    print("\n📦 Please install all required dependencies:")
+    print("\n  For conda users:")
+    print("    conda env update -f environment.yml --prune")
+    print("    conda activate slab-nesting")
+    print("\n  For pip users:")
+    print("    pip install -r requirements.txt")
+    print(f"\n{'='*70}\n")
+    sys.exit(1)
 
 # ============================================================================
 # PAGE SETUP
@@ -789,8 +805,9 @@ def poly_nest(parts: List[Part], config: NestingConfig):
 # ============================================================================
 # L-SHAPE GENERATOR
 # ============================================================================
+@st.cache_data
 def make_L_polygon(A: float, D: float, B: float, angle_deg: float) -> List[Tuple[float, float]]:
-    """Generate L-shape polygon points"""
+    """Generate L-shape polygon points (cached for performance)"""
     pts = [(0, 0), (A, 0), (A, D), (D, D), (D, B), (0, B), (0, 0)]
     if abs(angle_deg - 90.0) > 1e-6:
         theta = math.radians(90.0 - angle_deg)

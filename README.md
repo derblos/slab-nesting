@@ -27,56 +27,131 @@ A lightweight Streamlit app that nests **rectangular** parts onto slabs/sheets w
 ## Quickstart
 
 ### Requirements
-- Python 3.10+
-- pip
-- (Optional) Git, if you’re cloning or contributing
+- Python 3.10+ (up to 3.12 recommended)
+- **Conda** (Miniconda/Anaconda) or **pip**
+- Git (optional, for cloning)
 
-### Install & run
+---
 
+### Installation
+
+#### **Option 1: Using Conda (Recommended for Windows)**
+
+This is the **easiest and most reliable** method, especially on Windows.
+
+1. **Install Miniconda** (if not already installed):
+   - Download from: https://docs.conda.io/en/latest/miniconda.html
+   - Run the installer and follow the prompts
+
+2. **Clone or download this repository**:
+   ```bash
+   git clone https://github.com/<your-username>/slab-nesting.git
+   cd slab-nesting
+   ```
+
+3. **Create the conda environment**:
+   ```bash
+   conda env create -f environment.yml
+   ```
+
+4. **Activate the environment**:
+   ```bash
+   conda activate slab-nesting
+   ```
+
+5. **Run the application**:
+   ```bash
+   streamlit run app.py
+   ```
+
+#### **Option 2: Using pip with Virtual Environment**
+
+1. **Clone or download this repository**:
+   ```bash
+   git clone https://github.com/<your-username>/slab-nesting.git
+   cd slab-nesting
+   ```
+
+2. **Create a virtual environment**:
+   ```bash
+   # Windows PowerShell:
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+
+   # macOS/Linux:
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Run the application**:
+   ```bash
+   streamlit run app.py
+   ```
+
+---
+
+### Important Notes for Conda Users
+
+**Every time you work on this project**, you need to activate the conda environment first:
+
+#### **Method 1: Using Miniconda Prompt (Easiest)**
+1. Open **Miniconda3 Prompt** from Windows Start menu
+2. Navigate to your project:
+   ```bash
+   cd C:\Users\<YourUsername>\Documents\GitHub\slab-nesting
+   ```
+3. Activate the environment:
+   ```bash
+   conda activate slab-nesting
+   ```
+4. Run Streamlit:
+   ```bash
+   streamlit run app.py
+   ```
+
+#### **Method 2: Using Regular PowerShell/Terminal**
+If you've run `conda init powershell` (one-time setup), you can use your regular terminal:
+1. Open PowerShell
+2. Activate the environment:
+   ```bash
+   conda activate slab-nesting
+   ```
+3. Navigate to your project and run Streamlit
+
+---
+
+### Updating Dependencies
+
+If dependencies are updated in the future:
+
+**For conda users**:
 ```bash
-# 1) clone or open your local folder
-git clone https://github.com/<you>/slab-nesting.git
-cd slab-nesting
+conda env update -f environment.yml --prune
+```
 
-# 2) (recommended) virtual env
-python -m venv .venv
-# Windows PowerShell:
-. .\.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
+**For pip users**:
+```bash
+pip install -r requirements.txt --upgrade
+```
 
-# 3) dependencies
-pip install -r requirements.txt
+---
 
-# 4) run
-streamlit run app.py
-# Or:
-# python -m streamlit run app.py
+### Troubleshooting
 
-Short answer: Yes, you'll need to either:
+#### ❌ "No module named 'plotly'" (or similar errors)
+- **Solution**: Make sure you've installed all dependencies:
+  - Conda: `conda env update -f environment.yml --prune`
+  - pip: `pip install -r requirements.txt`
 
-Use the Miniconda Prompt, OR
-Activate the conda environment in your regular terminal each time
-Here's What You Need to Know
-Every time you work on this project:
-Option 1: Use Miniconda Prompt (Easiest)
+#### ❌ "conda: command not found"
+- **Solution**: Install Miniconda/Anaconda first, or use the pip method
 
-Open Miniconda3 Prompt from Windows Start menu
-Navigate to your project:
-cd C:\Users\Derik Blosser\documents\github\slab-nesting
-
-Activate your environment:
-conda activate slab-nesting
-
-Run streamlit:
-streamlit run app.py
-
-Option 2: Use Regular PowerShell/Terminal (After setup)
-If you successfully ran conda init powershell earlier, you can use your regular terminal:
-
-Open regular PowerShell
-Activate the environment:
-conda activate slab-nesting
-
-Navigate and run streamlit
+#### ❌ Application won't start
+- **Solution**: Ensure you've activated the environment (`conda activate slab-nesting`)
+- Check Python version: `python --version` (should be 3.10+)
 
