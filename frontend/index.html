@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nesting Tool - Professional Web UI</title>
+
+    <!-- Fabric.js for canvas manipulation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.0/fabric.min.js"></script>
+
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <!-- Custom styles -->
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="app-header">
+        <div class="header-left">
+            <i class="fas fa-cube"></i>
+            <h1>Nesting Tool Pro</h1>
+            <span class="version">v2.0 Web Edition</span>
+        </div>
+        <div class="header-right">
+            <div class="connection-status" id="connectionStatus">
+                <i class="fas fa-circle"></i>
+                <span>Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <div class="app-container">
+
+        <!-- Left Sidebar - Parts Library -->
+        <aside class="sidebar sidebar-left">
+            <div class="sidebar-header">
+                <h2><i class="fas fa-shapes"></i> Parts Library</h2>
+                <button class="btn btn-icon" onclick="refreshParts()" title="Refresh">
+                    <i class="fas fa-sync-alt"></i>
+                </button>
+            </div>
+
+            <!-- Add Part Section -->
+            <div class="add-part-section">
+                <h3>Quick Add</h3>
+                <div class="form-group">
+                    <label>Label</label>
+                    <input type="text" id="partLabel" placeholder="Part name" value="Part 1">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Width (in)</label>
+                        <input type="number" id="partWidth" value="50" step="0.25">
+                    </div>
+                    <div class="form-group">
+                        <label>Height (in)</label>
+                        <input type="number" id="partHeight" value="30" step="0.25">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Quantity</label>
+                        <input type="number" id="partQty" value="1" min="1">
+                    </div>
+                    <div class="form-group form-checkbox">
+                        <label>
+                            <input type="checkbox" id="partRotation" checked>
+                            Allow Rotation
+                        </label>
+                    </div>
+                </div>
+                <button class="btn btn-primary" onclick="addPart()">
+                    <i class="fas fa-plus"></i> Add Part
+                </button>
+            </div>
+
+            <!-- Parts List -->
+            <div class="parts-list-container">
+                <div class="parts-list-header">
+                    <h3>Parts (<span id="partsCount">0</span>)</h3>
+                    <button class="btn btn-sm btn-danger" onclick="clearAllParts()" title="Clear all">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+                <div class="parts-list" id="partsList">
+                    <div class="empty-state">
+                        <i class="fas fa-inbox"></i>
+                        <p>No parts yet</p>
+                        <small>Add a part to get started</small>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Canvas Area -->
+        <main class="canvas-area">
+            <!-- Toolbar -->
+            <div class="toolbar">
+                <div class="toolbar-left">
+                    <button class="btn btn-icon" onclick="canvas.clear()" title="Clear Canvas">
+                        <i class="fas fa-eraser"></i>
+                    </button>
+                    <button class="btn btn-icon" onclick="resetZoom()" title="Reset View">
+                        <i class="fas fa-search-minus"></i>
+                    </button>
+                    <div class="divider"></div>
+                    <span class="toolbar-label">
+                        <i class="fas fa-mouse-pointer"></i>
+                        Click and drag parts to arrange
+                    </span>
+                </div>
+                <div class="toolbar-right">
+                    <button class="btn btn-success btn-large" onclick="runNesting()">
+                        <i class="fas fa-magic"></i> Nest Parts
+                    </button>
+                </div>
+            </div>
+
+            <!-- Canvas -->
+            <div class="canvas-wrapper">
+                <canvas id="fabricCanvas"></canvas>
+            </div>
+
+            <!-- Status Bar -->
+            <div class="status-bar">
+                <div class="status-item">
+                    <i class="fas fa-info-circle"></i>
+                    <span id="statusMessage">Ready</span>
+                </div>
+                <div class="status-item">
+                    <i class="fas fa-mouse-pointer"></i>
+                    <span id="mousePosition">X: 0, Y: 0</span>
+                </div>
+            </div>
+        </main>
+
+        <!-- Right Sidebar - Settings & Results -->
+        <aside class="sidebar sidebar-right">
+            <!-- Sheet Settings -->
+            <div class="settings-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-cog"></i> Sheet Settings</h2>
+                </div>
+                <div class="form-group">
+                    <label>Sheet Width (in)</label>
+                    <input type="number" id="sheetWidth" value="139" step="1">
+                </div>
+                <div class="form-group">
+                    <label>Sheet Height (in)</label>
+                    <input type="number" id="sheetHeight" value="80" step="1">
+                </div>
+                <div class="form-group">
+                    <label>Clearance (in)</label>
+                    <input type="number" id="clearance" value="0.25" step="0.05">
+                </div>
+                <div class="form-group form-checkbox">
+                    <label>
+                        <input type="checkbox" id="allowRotation" checked>
+                        Allow Global Rotation
+                    </label>
+                </div>
+            </div>
+
+            <!-- Nesting Results -->
+            <div class="results-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-chart-bar"></i> Results</h2>
+                </div>
+                <div id="results">
+                    <div class="empty-state">
+                        <i class="fas fa-chart-line"></i>
+                        <p>No results yet</p>
+                        <small>Run nesting to see results</small>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-spinner">
+            <i class="fas fa-spinner fa-spin"></i>
+            <p>Processing...</p>
+        </div>
+    </div>
+
+    <!-- Custom JavaScript -->
+    <script src="app.js"></script>
+</body>
+</html>
