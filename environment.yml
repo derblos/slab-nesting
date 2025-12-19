@@ -17,3 +17,4 @@ dependencies:
       - rectpack>=0.2.2
       - shapely>=2.0.0,<3.0.0
       - streamlit-drawable-canvas>=0.9.3
+      - pyarrow>=14.0.0
