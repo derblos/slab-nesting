@@ -12,3 +12,4 @@ shapely>=2.0.0,<3.0.0
 # UI components
 streamlit-drawable-canvas>=0.9.3
 Pillow>=10.0.0,<11.0.0
+pyarrow>=14.0.0  # Required for streamlit-drawable-canvas
