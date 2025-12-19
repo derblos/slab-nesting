@@ -53,5 +53,30 @@ streamlit run app.py
 # Or:
 # python -m streamlit run app.py
 
-<img width="867" height="694" alt="image" src="https://github.com/user-attachments/assets/6d59bc8b-d427-4467-b414-bf61f6e1213c" />
+Short answer: Yes, you'll need to either:
+
+Use the Miniconda Prompt, OR
+Activate the conda environment in your regular terminal each time
+Here's What You Need to Know
+Every time you work on this project:
+Option 1: Use Miniconda Prompt (Easiest)
+
+Open Miniconda3 Prompt from Windows Start menu
+Navigate to your project:
+cd C:\Users\Derik Blosser\documents\github\slab-nesting
+
+Activate your environment:
+conda activate slab-nesting
+
+Run streamlit:
+streamlit run app.py
+
+Option 2: Use Regular PowerShell/Terminal (After setup)
+If you successfully ran conda init powershell earlier, you can use your regular terminal:
+
+Open regular PowerShell
+Activate the environment:
+conda activate slab-nesting
+
+Navigate and run streamlit
 
