@@ -5,7 +5,7 @@ This allows the existing code to use 'from rectpack import newPacker'
 while using the rectangle-packer library under the hood.
 """
 
-from rpack import pack, pack_multiple, PackingMode, PackingBin
+from rpack import pack
 
 
 class Packer:
