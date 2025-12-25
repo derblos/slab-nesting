@@ -65,42 +65,51 @@ function initCanvas() {
     });
 
     // Prevent context menu on canvas
-    canvasEl.addEventListener('contextmenu', (e) => {
+    const canvasElement = document.getElementById('fabricCanvas');
+    canvasElement.addEventListener('contextmenu', (e) => {
+        console.log('Context menu prevented');
         e.preventDefault();
         return false;
     });
 
-    // Add direct mousedown listener for better right-click detection
-    canvasEl.addEventListener('mousedown', (e) => {
-        if (!drawingMode) return;
+    // CRITICAL: Direct right-click handler to bypass Fabric.js
+    // This must be on the actual canvas element, not the Fabric canvas object
+    console.log('Setting up direct mousedown handler on canvas element');
 
-        console.log('🖱️ Raw canvas mousedown:', {
+    canvasElement.addEventListener('mousedown', function(e) {
+        console.log('🖱️ DIRECT mousedown event:', {
             button: e.button,
             which: e.which,
             buttons: e.buttons,
-            type: e.type
+            drawingMode: drawingMode,
+            target: e.target
         });
 
-        // Handle right-click directly
+        if (!drawingMode) return;
+
+        // Handle right-click (button 2)
         if (e.button === 2) {
             e.preventDefault();
-            e.stopPropagation();
+            e.stopImmediatePropagation();
 
-            const rect = canvasEl.getBoundingClientRect();
+            const rect = canvasElement.getBoundingClientRect();
             const pointer = {
                 x: e.clientX - rect.left,
                 y: e.clientY - rect.top
             };
 
-            console.log('🎯 RIGHT-CLICK detected! Adding corner at:', pointer);
+            console.log('🎯 RIGHT-CLICK DETECTED! Adding corner at:', pointer);
 
             if (currentDrawing) {
                 addCorner(pointer);
             } else {
                 updateStatus('Left-click first to start drawing');
             }
+            return false;
         }
-    }, true); // Use capture phase
+    }, true); // Use capture phase to intercept before Fabric.js
+
+    console.log('Direct mousedown handler attached successfully');
 }
 
 function drawGrid() {
