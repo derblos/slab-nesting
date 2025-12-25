@@ -69,6 +69,38 @@ function initCanvas() {
         e.preventDefault();
         return false;
     });
+
+    // Add direct mousedown listener for better right-click detection
+    canvasEl.addEventListener('mousedown', (e) => {
+        if (!drawingMode) return;
+
+        console.log('🖱️ Raw canvas mousedown:', {
+            button: e.button,
+            which: e.which,
+            buttons: e.buttons,
+            type: e.type
+        });
+
+        // Handle right-click directly
+        if (e.button === 2) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const rect = canvasEl.getBoundingClientRect();
+            const pointer = {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+
+            console.log('🎯 RIGHT-CLICK detected! Adding corner at:', pointer);
+
+            if (currentDrawing) {
+                addCorner(pointer);
+            } else {
+                updateStatus('Left-click first to start drawing');
+            }
+        }
+    }, true); // Use capture phase
 }
 
 function drawGrid() {
@@ -115,15 +147,37 @@ function toggleDrawMode() {
         controls.style.gap = '10px';
         wrapper.classList.add('drawing-mode');
         hint.textContent = 'Left-click to start | Right-click to add corner | Left-click to finish';
+
+        // Disable object selection and interaction during drawing
         canvas.selection = false;
+        canvas.defaultCursor = 'crosshair';
+        canvas.hoverCursor = 'crosshair';
+        canvas.forEachObject(obj => {
+            obj.selectable = false;
+            obj.evented = false;
+        });
+
+        console.log('✅ Draw mode ACTIVATED');
         updateStatus('Draw mode active - Left-click to start drawing');
     } else {
         btn.classList.remove('active');
         controls.style.display = 'none';
         wrapper.classList.remove('drawing-mode');
         hint.textContent = 'Click parts to add to canvas';
+
+        // Re-enable object selection
         canvas.selection = true;
+        canvas.defaultCursor = 'default';
+        canvas.hoverCursor = 'move';
+        canvas.forEachObject(obj => {
+            if (obj.objectType !== 'grid' && obj.objectType !== 'preview') {
+                obj.selectable = true;
+                obj.evented = true;
+            }
+        });
+
         cancelDrawing();
+        console.log('❌ Draw mode DEACTIVATED');
         updateStatus('Draw mode disabled');
     }
 }
@@ -141,38 +195,58 @@ function handleMouseMove(e) {
 function handleMouseDown(e) {
     if (!drawingMode) return;
 
-    // Prevent default to stop context menu
-    if (e.e.button === 2) {
-        e.e.preventDefault();
-        e.e.stopPropagation();
-    }
+    // Get the raw event
+    const evt = e.e;
 
-    const pointer = canvas.getPointer(e.e);
+    // Prevent default to stop context menu and other interference
+    evt.preventDefault();
+    evt.stopPropagation();
 
-    // Check which button was pressed
-    const isLeftClick = (e.e.button === 0 || e.e.which === 1);
-    const isRightClick = (e.e.button === 2 || e.e.which === 3);
+    const pointer = canvas.getPointer(evt);
+
+    // Debug logging - check browser console (F12)
+    console.log('Mouse down detected:', {
+        button: evt.button,
+        which: evt.which,
+        buttons: evt.buttons,
+        currentDrawing: currentDrawing,
+        pointsCount: drawingPoints.length
+    });
+
+    // More robust button detection for Windows
+    const isLeftClick = (evt.button === 0 && evt.buttons === 1) || (evt.which === 1);
+    const isRightClick = (evt.button === 2 && evt.buttons === 2) || (evt.which === 3);
+
+    console.log('Click type:', { isLeftClick, isRightClick });
 
     if (isLeftClick) {
         if (!currentDrawing) {
             // First left click - start drawing
+            console.log('Starting drawing at:', pointer);
             startDrawing(pointer);
         } else {
             // Second left click - finish drawing (need at least 2 points)
             if (drawingPoints.length < 2) {
+                console.log('Not enough points to finish');
                 updateStatus('❌ Need at least one corner! Right-click to add corners, then left-click to finish');
                 return;
             }
+            console.log('Finishing drawing');
             finishDrawing();
         }
     }
     else if (isRightClick) {
         // Right click - add corner
         if (currentDrawing) {
+            console.log('Adding corner at:', pointer);
             addCorner(pointer);
         } else {
+            console.log('Not drawing yet, cannot add corner');
             updateStatus('Left-click first to start drawing');
         }
+    }
+    else {
+        console.log('⚠️ Unknown button pressed');
     }
 }
 
