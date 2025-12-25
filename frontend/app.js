@@ -224,7 +224,7 @@ function updateDrawingPreview(currentPointer) {
     const width = parseFloat(document.getElementById('drawWidth').value) * 3;
     const lastPoint = drawingPoints[drawingPoints.length - 1];
 
-    // Calculate preview line
+    // Calculate preview line direction
     let direction;
     if (drawingPoints.length === 1) {
         const dx = currentPointer.x - lastPoint.x;
@@ -253,43 +253,42 @@ function updateDrawingPreview(currentPointer) {
         y: lastPoint.y + direction.y * length
     };
 
-    // Draw preview line
-    drawingPreview = new fabric.Line([lastPoint.x, lastPoint.y, previewEnd.x, previewEnd.y], {
+    // Create centerline points including preview
+    const allPoints = [...drawingPoints, previewEnd];
+
+    // Expand the path to show full width rectangle
+    const polygonPoints = expandPathWithWidth(allPoints, width);
+
+    // Draw preview polygon with width
+    drawingPreview = new fabric.Polygon(polygonPoints, {
+        fill: 'rgba(52, 152, 219, 0.3)',  // Semi-transparent blue
         stroke: '#3498db',
-        strokeWidth: 3,
-        strokeDashArray: [5, 5],
+        strokeWidth: 2,
+        strokeDashArray: [8, 4],
         selectable: false,
         evented: false,
         objectType: 'preview'
     });
     canvas.add(drawingPreview);
 
-    // Draw all segments with dimensions
-    for (let i = 0; i < drawingPoints.length - 1; i++) {
-        const p1 = drawingPoints[i];
-        const p2 = drawingPoints[i + 1];
-
-        const line = new fabric.Line([p1.x, p1.y, p2.x, p2.y], {
-            stroke: '#2c3e50',
-            strokeWidth: 3,
-            selectable: false,
-            evented: false,
-            objectType: 'preview'
-        });
-        canvas.add(line);
+    // Draw dimension labels on all segments
+    for (let i = 0; i < allPoints.length - 1; i++) {
+        const p1 = allPoints[i];
+        const p2 = allPoints[i + 1];
 
         // Add dimension label
         const segLength = Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2) / 3;
         const midX = (p1.x + p2.x) / 2;
         const midY = (p1.y + p2.y) / 2;
 
-        const label = new fabric.Text(`${segLength.toFixed(2)}"`, {
+        const isPreview = (i === allPoints.length - 2);
+        const label = new fabric.Text(`${segLength.toFixed(1)}"`, {
             left: midX,
-            top: midY - 15,
-            fontSize: 12,
+            top: midY - 20,
+            fontSize: 14,
             fill: 'white',
-            backgroundColor: 'rgba(44, 62, 80, 0.9)',
-            padding: 4,
+            backgroundColor: isPreview ? 'rgba(52, 152, 219, 0.9)' : 'rgba(44, 62, 80, 0.9)',
+            padding: 6,
             selectable: false,
             evented: false,
             objectType: 'preview'
@@ -298,21 +297,21 @@ function updateDrawingPreview(currentPointer) {
         canvas.add(label);
     }
 
-    // Preview dimension
-    const previewLength = length / 3;
-    const previewLabel = new fabric.Text(`${previewLength.toFixed(2)}"`, {
-        left: (lastPoint.x + previewEnd.x) / 2,
-        top: (lastPoint.y + previewEnd.y) / 2 - 15,
-        fontSize: 12,
+    // Add width label
+    const widthInches = width / 3;
+    const widthLabel = new fabric.Text(`Width: ${widthInches.toFixed(1)}"`, {
+        left: allPoints[0].x,
+        top: allPoints[0].y - 40,
+        fontSize: 14,
         fill: 'white',
-        backgroundColor: 'rgba(52, 152, 219, 0.9)',
-        padding: 4,
+        backgroundColor: 'rgba(231, 76, 60, 0.9)',
+        padding: 6,
         selectable: false,
         evented: false,
         objectType: 'preview'
     });
-    drawingLabels.push(previewLabel);
-    canvas.add(previewLabel);
+    drawingLabels.push(widthLabel);
+    canvas.add(widthLabel);
 
     canvas.renderAll();
 }
