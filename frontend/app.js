@@ -69,6 +69,38 @@ function initCanvas() {
         e.preventDefault();
         return false;
     });
+
+    // Add direct mousedown listener for better right-click detection
+    canvasEl.addEventListener('mousedown', (e) => {
+        if (!drawingMode) return;
+
+        console.log('🖱️ Raw canvas mousedown:', {
+            button: e.button,
+            which: e.which,
+            buttons: e.buttons,
+            type: e.type
+        });
+
+        // Handle right-click directly
+        if (e.button === 2) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const rect = canvasEl.getBoundingClientRect();
+            const pointer = {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+
+            console.log('🎯 RIGHT-CLICK detected! Adding corner at:', pointer);
+
+            if (currentDrawing) {
+                addCorner(pointer);
+            } else {
+                updateStatus('Left-click first to start drawing');
+            }
+        }
+    }, true); // Use capture phase
 }
 
 function drawGrid() {
