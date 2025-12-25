@@ -141,20 +141,37 @@ function handleMouseMove(e) {
 function handleMouseDown(e) {
     if (!drawingMode) return;
 
+    // Prevent default to stop context menu
+    if (e.e.button === 2) {
+        e.e.preventDefault();
+        e.e.stopPropagation();
+    }
+
     const pointer = canvas.getPointer(e.e);
 
-    // Left click (button 0 or 1)
-    if (e.e.button === 0) {
+    // Check which button was pressed
+    const isLeftClick = (e.e.button === 0 || e.e.which === 1);
+    const isRightClick = (e.e.button === 2 || e.e.which === 3);
+
+    if (isLeftClick) {
         if (!currentDrawing) {
+            // First left click - start drawing
             startDrawing(pointer);
         } else {
+            // Second left click - finish drawing (need at least 2 points)
+            if (drawingPoints.length < 2) {
+                updateStatus('❌ Need at least one corner! Right-click to add corners, then left-click to finish');
+                return;
+            }
             finishDrawing();
         }
     }
-    // Right click (button 2)
-    else if (e.e.button === 2) {
+    else if (isRightClick) {
+        // Right click - add corner
         if (currentDrawing) {
             addCorner(pointer);
+        } else {
+            updateStatus('Left-click first to start drawing');
         }
     }
 }
@@ -431,10 +448,12 @@ function cancelDrawing() {
 
 function expandPathWithWidth(centerPoints, width) {
     // Create a polygon by offsetting the path by width/2 on both sides
-    // For simplicity, create rectangle segments and merge
     const halfWidth = width / 2;
     const result = [];
 
+    if (centerPoints.length < 2) return [];
+
+    // Build one side of the path
     for (let i = 0; i < centerPoints.length - 1; i++) {
         const p1 = centerPoints[i];
         const p2 = centerPoints[i + 1];
@@ -443,6 +462,8 @@ function expandPathWithWidth(centerPoints, width) {
         const dx = p2.x - p1.x;
         const dy = p2.y - p1.y;
         const length = Math.sqrt(dx * dx + dy * dy);
+        if (length === 0) continue;
+
         const perpX = -dy / length * halfWidth;
         const perpY = dx / length * halfWidth;
 
@@ -452,18 +473,47 @@ function expandPathWithWidth(centerPoints, width) {
         result.push({ x: p2.x + perpX, y: p2.y + perpY });
     }
 
-    // Add opposite side
-    for (let i = centerPoints.length - 1; i > 0; i--) {
+    // Add end cap for the last point
+    const lastSegIdx = centerPoints.length - 2;
+    const p1 = centerPoints[lastSegIdx];
+    const p2 = centerPoints[lastSegIdx + 1];
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const length = Math.sqrt(dx * dx + dy * dy);
+    if (length > 0) {
+        const perpX = -dy / length * halfWidth;
+        const perpY = dx / length * halfWidth;
+        result.push({ x: p2.x - perpX, y: p2.y - perpY });
+    }
+
+    // Build opposite side (going backwards)
+    for (let i = centerPoints.length - 2; i >= 0; i--) {
         const p1 = centerPoints[i];
-        const p2 = centerPoints[i - 1];
+        const p2 = centerPoints[i + 1];
 
         const dx = p2.x - p1.x;
         const dy = p2.y - p1.y;
         const length = Math.sqrt(dx * dx + dy * dy);
+        if (length === 0) continue;
+
         const perpX = -dy / length * halfWidth;
         const perpY = dx / length * halfWidth;
 
-        result.push({ x: p1.x + perpX, y: p1.y + perpY });
+        if (i > 0) {
+            result.push({ x: p1.x - perpX, y: p1.y - perpY });
+        }
+    }
+
+    // Add start cap
+    const firstP1 = centerPoints[0];
+    const firstP2 = centerPoints[1];
+    const firstDx = firstP2.x - firstP1.x;
+    const firstDy = firstP2.y - firstP1.y;
+    const firstLength = Math.sqrt(firstDx * firstDx + firstDy * firstDy);
+    if (firstLength > 0) {
+        const perpX = -firstDy / firstLength * halfWidth;
+        const perpY = firstDx / firstLength * halfWidth;
+        result.push({ x: firstP1.x - perpX, y: firstP1.y - perpY });
     }
 
     return result;
